@@ -28,7 +28,7 @@ from ayon_core.pipeline import PublishValidationError
 from ayon_maya.api import plugin
 from ayon_maya.api.lib import maintained_selection
 from maya import cmds
-from pxr import Sdf, Usd
+from pxr import Sdf
 
 
 def parse_version(version_str):
@@ -49,7 +49,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
 
         Steps:
         1. Export selected geometry with animation (as point cache)
-        2. Remap hierarchy to match original asset prim path
+        2. Remap hierarchy + apply resetXformStack (single Sdf pass)
         3. Generate representation
         """
 
@@ -60,7 +60,13 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         cache_file = self._export_animation_cache(instance, staging_dir)
 
         # 2. Remap hierarchy to match original asset prim path
-        self._remap_to_asset_hierarchy(cache_file, instance)
+        #    and optionally apply !resetXformStack! to prevent
+        #    double-transforms from layout positioning.
+        creator_attrs = instance.data.get("creator_attributes", {})
+        apply_reset = creator_attrs.get("resetXformStack", True)
+        self._remap_to_asset_hierarchy(
+            cache_file, instance, reset_xform_stack=apply_reset
+        )
 
         cache_filename = os.path.basename(cache_file)
 
@@ -182,10 +188,11 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         return filepath
 
     # ------------------------------------------------------------------
-    # Hierarchy remapping
+    # Hierarchy remapping + resetXformStack
     # ------------------------------------------------------------------
 
-    def _remap_to_asset_hierarchy(self, filepath, instance):
+    def _remap_to_asset_hierarchy(self, filepath, instance,
+                                  reset_xform_stack=False):
         """Remap exported USD hierarchy to match original asset prim path.
 
         When exporting geometry from 'Edit as Maya Data', the Maya USD
@@ -205,6 +212,19 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         2. Creates a new layer with the correct target hierarchy
         3. Copies the geometry subtree to the correct location
         4. Cleans up non-geometry prims (rig controls, materials)
+        5. Optionally applies ``!resetXformStack!`` to the asset prim
+           and its geometry children (to prevent double-transforms when
+           the cache was exported with ``worldspace=True``)
+
+        All operations happen on an in-memory ``Sdf.Layer`` before a
+        single ``Export()`` to disk, which avoids layer-cache / mmap
+        corruption issues with binary ``.usdc`` files on Windows.
+
+        Args:
+            filepath: Path to the exported USD file.
+            instance: Publish instance.
+            reset_xform_stack: If True, add ``!resetXformStack!`` to the
+                asset root prim and its geometry children.
         """
         original_path = instance.data.get("originalAssetPrimPath", "")
         if not original_path:
@@ -240,6 +260,10 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
 
         if source_path == target_path:
             self.log.debug("Hierarchy already correct, no remapping needed")
+            # Even if no remap needed, we may still need resetXformStack
+            if reset_xform_stack:
+                self._apply_reset_xform_stack_sdf(layer, target_path)
+                layer.Save()
             return
 
         self.log.info(f"Remapping hierarchy: {source_path} -> {target_path}")
@@ -269,11 +293,78 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         # Clean up non-geometry prims (rig controls, materials, etc.)
         self._cleanup_non_geometry(new_layer, target_path)
 
-        # Save the remapped layer
+        # Apply resetXformStack before saving — all in-memory, no
+        # layer-cache or mmap issues.
+        if reset_xform_stack:
+            self._apply_reset_xform_stack_sdf(new_layer, target_path)
+
+        # Save the remapped layer (single write to disk)
         new_layer.Export(filepath)
         self.log.info(
             f"Hierarchy remapped successfully: {source_path} -> {target_path}"
         )
+
+    def _apply_reset_xform_stack_sdf(self, layer, root_path):
+        """Add ``!resetXformStack!`` via the Sdf (scene-description) API.
+
+        Directly manipulates the ``xformOpOrder`` attribute on PrimSpecs
+        in the given layer.  This avoids having to open a ``Usd.Stage``
+        (and the layer-cache / mmap problems that come with it on
+        Windows when the file was just rewritten by ``Export()``).
+
+        The reset token is prepended to the existing ``xformOpOrder``
+        list.  If no ``xformOpOrder`` exists yet, one is created with
+        just the reset token.
+
+        Applied to:
+        - The prim at *root_path* itself (the asset root)
+        - All direct children whose typeName is Mesh, Xform, or Scope
+        """
+        RESET_TOKEN = "!resetXformStack!"
+        xformable_types = {"Xform", "Scope", "Mesh"}
+
+        def _set_reset(prim_spec):
+            """Prepend !resetXformStack! to xformOpOrder on a PrimSpec."""
+            if prim_spec is None:
+                return False
+
+            attr = prim_spec.attributes.get("xformOpOrder")
+            if attr is not None:
+                current = list(attr.default)
+                if RESET_TOKEN in current:
+                    return False  # already present
+                attr.default = [RESET_TOKEN] + current
+            else:
+                # Create the attribute with just the reset token
+                attr = Sdf.AttributeSpec(
+                    prim_spec,
+                    "xformOpOrder",
+                    Sdf.ValueTypeNames.TokenArray
+                )
+                attr.default = [RESET_TOKEN]
+
+            self.log.debug(
+                f"Added resetXformStack to: {prim_spec.path}"
+            )
+            return True
+
+        modified = False
+
+        # Apply to the root prim
+        root_spec = layer.GetPrimAtPath(root_path)
+        if root_spec and root_spec.typeName in xformable_types:
+            modified |= _set_reset(root_spec)
+
+        # Apply to direct children
+        if root_spec:
+            for child_spec in root_spec.nameChildren:
+                if child_spec.typeName in xformable_types:
+                    modified |= _set_reset(child_spec)
+
+        if modified:
+            self.log.info(
+                "Applied !resetXformStack! to prevent double-transforms"
+            )
 
     def _copy_layer_metadata(self, source_layer, target_layer):
         """Copy layer-level metadata (timeCode, upAxis, etc.)."""
