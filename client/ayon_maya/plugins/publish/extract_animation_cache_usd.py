@@ -212,8 +212,22 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         ``resetXformStack`` on:
         - The asset root prim (if it is Xformable)
         - All direct geometry children (Mesh, etc.)
+
+        Note: Uses Sdf.Layer.Reload() to flush the layer registry cache
+        after the hierarchy remap step rewrites the file on disk.
         """
         original_path = instance.data.get("originalAssetPrimPath", "")
+
+        # The previous remap step may have rewritten this file via
+        # new_layer.Export(filepath), but the old Sdf.Layer is still
+        # cached in the registry.  We must either reload or clear it
+        # so that Usd.Stage.Open sees the current on-disk content.
+        stale_layer = Sdf.Layer.Find(filepath)
+        if stale_layer:
+            stale_layer.Reload()
+            self.log.debug(
+                "Reloaded cached layer to pick up remapped hierarchy"
+            )
 
         stage = Usd.Stage.Open(filepath)
         if not stage:
@@ -224,23 +238,43 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
 
         modified = False
 
-        # Determine which prim to apply resetXformStack to
+        # Determine which prim to apply resetXformStack to.
+        # Try originalAssetPrimPath first, then defaultPrim, then first
+        # root prim.  Log available prims on failure to aid debugging.
+        target_prim = None
         if original_path:
             target_prim = stage.GetPrimAtPath(original_path)
-        else:
-            # Fallback: use the defaultPrim or first root prim
-            target_prim = stage.GetDefaultPrim()
             if not target_prim or not target_prim.IsValid():
-                root_prims = [
-                    p for p in stage.GetPseudoRoot().GetChildren()
-                ]
-                target_prim = root_prims[0] if root_prims else None
+                self.log.debug(
+                    f"Prim not found at originalAssetPrimPath: "
+                    f"{original_path}"
+                )
+                target_prim = None
+
+        if not target_prim:
+            target_prim = stage.GetDefaultPrim()
 
         if not target_prim or not target_prim.IsValid():
+            root_prims = list(stage.GetPseudoRoot().GetChildren())
+            if root_prims:
+                target_prim = root_prims[0]
+
+        if not target_prim or not target_prim.IsValid():
+            # Log all available root prims for debugging
+            available = [
+                str(p.GetPath())
+                for p in stage.GetPseudoRoot().GetChildren()
+            ]
             self.log.warning(
-                "No valid prim found for resetXformStack application"
+                "No valid prim found for resetXformStack application. "
+                f"Available root prims: {available}"
             )
             return
+
+        self.log.debug(
+            f"Applying resetXformStack to target prim: "
+            f"{target_prim.GetPath()}"
+        )
 
         # Apply to the asset root prim itself
         xformable = UsdGeom.Xformable(target_prim)
