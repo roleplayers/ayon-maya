@@ -104,17 +104,19 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         self.log.info(f"✓ Extracted point cache: {cache_filename}")
 
     def _find_geometry_shapes(self, nodes):
-        """Find mesh shapes in the selected nodes.
+        """Find mesh shapes in the selected nodes or their siblings/parents.
 
-        If nodes are transforms/groups, look for shapes inside them.
-        This handles cases like:
-        - Selected transform: /rig/geo → finds /rig/geo/mesh_SHAPE
-        - Selected shape: /rig/geo/mesh_SHAPE → uses it directly
+        Smart search strategy:
+        1. If it's a shape, use it directly
+        2. Find shapes inside the node (descendants)
+        3. Find shapes in sibling 'geo' groups
+        4. Search entire parent structure for geo nodes
         """
         shapes = []
+        searched_paths = set()
 
         for node in nodes:
-            # Check if it's already a shape
+            # 1. Check if it's already a shape
             try:
                 node_type = cmds.nodeType(node)
                 if node_type == "mesh":
@@ -123,42 +125,124 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             except:
                 pass
 
-            # Try to find shapes inside this node
+            # 2. Find shapes as descendants inside this node
             try:
-                # Get all descendants that are meshes
                 descendants = cmds.listRelatives(
                     node, shapes=True, type="mesh", allDescendents=True, fullPath=True
                 )
                 if descendants:
                     shapes.extend(descendants)
+                    searched_paths.add(node)
                     continue
             except:
                 pass
 
-            # If still nothing, maybe it's in __mayaUsd__ namespace
+            # 3. If parent has a 'geo' sibling, search there
             try:
-                # Try searching with wildcard
-                found = cmds.ls(f"{node}|*", type="mesh", long=True)
-                if found:
-                    shapes.extend(found)
+                parent = cmds.listRelatives(node, parent=True, fullPath=True)
+                if parent:
+                    parent = parent[0]
+                    # Look for geo group in parent's children
+                    children = cmds.listRelatives(parent, children=True, fullPath=True) or []
+                    for child in children:
+                        if "geo" in child.lower() and child not in searched_paths:
+                            geo_shapes = cmds.listRelatives(
+                                child, shapes=True, type="mesh", allDescendents=True, fullPath=True
+                            )
+                            if geo_shapes:
+                                shapes.extend(geo_shapes)
+                                searched_paths.add(child)
+                                break
             except:
                 pass
+
+            # 4. Search entire asset root for any geo/mesh
+            if not shapes:
+                try:
+                    # Get root - trace back to topmost parent
+                    current = node
+                    root = node
+                    while True:
+                        parent = cmds.listRelatives(current, parent=True, fullPath=True)
+                        if not parent:
+                            root = current
+                            break
+                        root = parent[0]
+                        current = root
+
+                    # Now search from root for geo nodes
+                    all_children = cmds.listRelatives(root, allDescendents=True, fullPath=True) or []
+                    geo_nodes = [n for n in all_children if "geo" in n.lower()]
+
+                    for geo_node in geo_nodes:
+                        if geo_node not in searched_paths:
+                            geo_shapes = cmds.listRelatives(
+                                geo_node, shapes=True, type="mesh", allDescendents=True, fullPath=True
+                            )
+                            if geo_shapes:
+                                shapes.extend(geo_shapes)
+                                searched_paths.add(geo_node)
+                                break
+                except Exception as e:
+                    self.log.debug(f"Could not search from root: {e}")
+
+            # 5. Last resort: direct wildcard search in node's subtree
+            if not shapes:
+                try:
+                    found = cmds.ls(f"{node}|*", type="mesh", long=True)
+                    if found:
+                        shapes.extend(found)
+                except:
+                    pass
 
         return list(set(shapes)) if shapes else []
 
     def _suggest_geometry_path(self, nodes):
-        """Suggest a better path for geometry selection."""
-        suggestions = []
-        for node in nodes:
-            # Build a suggestion based on the path
-            if "geo" in node.lower():
-                suggestions.append(f"  {node}/SHAPE")
-            elif "rig" in node.lower():
-                suggestions.append(f"  {node}/geo/SHAPE")
-            else:
-                suggestions.append(f"  {node}/*/SHAPE")
+        """Show what was searched and suggest correct selection."""
+        msg_lines = ["POINT CACHE requires: mesh/nurbsSurface shapes with animation"]
+        msg_lines.append("WRONG: Selecting rig groups or control transforms")
+        msg_lines.append("RIGHT: Select the deformed geometry (geo/mesh_SHAPE)\n")
 
-        return "\n".join(suggestions) if suggestions else "Check your rig structure"
+        for node in nodes:
+            msg_lines.append(f"Selected: {node}")
+
+            # Try to show the actual hierarchy for debugging
+            try:
+                # Get root and show children
+                current = node
+                root = node
+                while True:
+                    parent = cmds.listRelatives(current, parent=True, fullPath=True)
+                    if not parent:
+                        root = current
+                        break
+                    root = parent[0]
+                    current = root
+
+                msg_lines.append(f"Asset root: {root}")
+
+                # List immediate children and geo nodes
+                all_desc = cmds.listRelatives(root, allDescendents=True, fullPath=True) or []
+                geo_nodes = [n for n in all_desc if "geo" in n.lower()]
+
+                if geo_nodes:
+                    msg_lines.append("Found GEO groups:")
+                    for geo in geo_nodes[:3]:  # Show first 3
+                        msg_lines.append(f"  → {geo}")
+                        # Show shapes inside
+                        shapes = cmds.listRelatives(
+                            geo, shapes=True, type="mesh", allDescendents=True, fullPath=True
+                        )
+                        if shapes:
+                            for shape in shapes[:2]:
+                                msg_lines.append(f"      └─ {shape}")
+                else:
+                    msg_lines.append("No GEO groups found in hierarchy")
+
+            except Exception as e:
+                msg_lines.append(f"Could not analyze hierarchy: {e}")
+
+        return "\n".join(msg_lines)
 
     def _export_animation_cache(self, instance, staging_dir) -> str:
         """Export animated geometry as USD point cache.
