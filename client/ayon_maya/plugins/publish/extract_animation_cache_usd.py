@@ -307,6 +307,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         if source_path == target_path:
             self.log.debug("Hierarchy already correct, no remapping needed")
             # Still need to sanitise the layer for override use
+            self._strip_geom_subsets(layer, target_path)
             self._strip_material_bindings(layer, target_path)
             self._convert_to_over_specifiers(layer, target_path)
             if reset_xform_stack:
@@ -343,6 +344,11 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
 
         # Clean up non-geometry prims (rig controls, materials, etc.)
         self._cleanup_non_geometry(new_layer, target_path)
+
+        # Strip GeomSubsets — face-material assignments come from the
+        # original asset; the cache's copies carry namespace-mangled
+        # names that don't match and would create orphaned overs.
+        self._strip_geom_subsets(new_layer, target_path)
 
         # Strip material:binding relationships so the original asset's
         # material assignments pass through the composition.
@@ -535,6 +541,46 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         if count:
             self.log.debug(
                 f"Stripped {count} material:binding relationship(s)"
+            )
+
+    def _strip_geom_subsets(self, layer, root_path):
+        """Remove all ``GeomSubset`` prims from the cache layer.
+
+        GeomSubsets define per-face material assignments (shading
+        groups).  In a point-cache override layer they are unnecessary
+        — the original asset already carries the correct face-set
+        definitions.
+
+        Worse, when the geometry is inside a rig with a namespace (e.g.
+        ``rigMain:``), ``stripNamespaces`` only strips DAG node names
+        but converts the ``:`` in shading-group names to ``_``.  This
+        produces GeomSubset names like
+        ``rigMain_cc5mat_SG_Std_Skin_Body`` which do not match the
+        original asset's ``cc5mat_SG_Std_Skin_Body``, leaving orphaned
+        ``over`` prims in the cache.
+        """
+        to_remove = []
+
+        def _collect(path):
+            spec = layer.GetPrimAtPath(path)
+            if not spec:
+                return
+            for child_spec in list(spec.nameChildren):
+                child_path = path.AppendChild(child_spec.name)
+                if child_spec.typeName == "GeomSubset":
+                    to_remove.append(child_path)
+                else:
+                    _collect(child_path)
+
+        _collect(root_path)
+
+        if to_remove:
+            edit = Sdf.BatchNamespaceEdit()
+            for path in reversed(to_remove):
+                edit.Add(path, Sdf.Path.emptyPath)
+            layer.Apply(edit)
+            self.log.debug(
+                f"Stripped {len(to_remove)} GeomSubset prim(s)"
             )
 
     def _convert_to_over_specifiers(self, layer, root_path):
