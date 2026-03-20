@@ -35,6 +35,36 @@ def parse_version(version_str):
     return tuple(int(v) for v in version_str.split("."))
 
 
+def find_mesh_shapes(nodes):
+    """Find all mesh shapes under given nodes (recursively).
+
+    Args:
+        nodes: List of node names/paths
+
+    Returns:
+        List of mesh shape nodes
+    """
+    shapes = []
+    for node in nodes:
+        # Get all shapes under this node (including nested)
+        try:
+            # Use ls to find all mesh shapes in subtree
+            found_shapes = cmds.ls(f"{node}|*", type="mesh", long=True)
+            if not found_shapes:
+                # Try direct children if it's a transform
+                found_shapes = cmds.listRelatives(node, shapes=True, type="mesh", allDescendents=True)
+            if found_shapes:
+                shapes.extend(found_shapes)
+            else:
+                # If node itself is a mesh, use it
+                if cmds.nodeType(node) == "mesh":
+                    shapes.append(node)
+        except Exception as e:
+            pass
+
+    return list(set(shapes)) if shapes else []
+
+
 class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
     """Extract animation cache as USD point cache."""
 
@@ -72,6 +102,63 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         })
 
         self.log.info(f"✓ Extracted point cache: {cache_filename}")
+
+    def _find_geometry_shapes(self, nodes):
+        """Find mesh shapes in the selected nodes.
+
+        If nodes are transforms/groups, look for shapes inside them.
+        This handles cases like:
+        - Selected transform: /rig/geo → finds /rig/geo/mesh_SHAPE
+        - Selected shape: /rig/geo/mesh_SHAPE → uses it directly
+        """
+        shapes = []
+
+        for node in nodes:
+            # Check if it's already a shape
+            try:
+                node_type = cmds.nodeType(node)
+                if node_type == "mesh":
+                    shapes.append(node)
+                    continue
+            except:
+                pass
+
+            # Try to find shapes inside this node
+            try:
+                # Get all descendants that are meshes
+                descendants = cmds.listRelatives(
+                    node, shapes=True, type="mesh", allDescendents=True, fullPath=True
+                )
+                if descendants:
+                    shapes.extend(descendants)
+                    continue
+            except:
+                pass
+
+            # If still nothing, maybe it's in __mayaUsd__ namespace
+            try:
+                # Try searching with wildcard
+                found = cmds.ls(f"{node}|*", type="mesh", long=True)
+                if found:
+                    shapes.extend(found)
+            except:
+                pass
+
+        return list(set(shapes)) if shapes else []
+
+    def _suggest_geometry_path(self, nodes):
+        """Suggest a better path for geometry selection."""
+        suggestions = []
+        for node in nodes:
+            # Build a suggestion based on the path
+            if "geo" in node.lower():
+                suggestions.append(f"  {node}/SHAPE")
+            elif "rig" in node.lower():
+                suggestions.append(f"  {node}/geo/SHAPE")
+            else:
+                suggestions.append(f"  {node}/*/SHAPE")
+
+        return "\n".join(suggestions) if suggestions else "Check your rig structure"
 
     def _export_animation_cache(self, instance, staging_dir) -> str:
         """Export animated geometry as USD point cache.
@@ -112,7 +199,21 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                 f"No members to export for {instance.name}"
             )
 
-        self.log.info(f"Exporting point cache for: {members}")
+        # IMPORTANT: Validate and find actual geometry
+        # If members are transforms/groups, try to find shapes inside them
+        shapes_to_export = self._find_geometry_shapes(members)
+
+        if not shapes_to_export:
+            raise PublishValidationError(
+                f"No geometry found to export!\n"
+                f"Selected nodes: {members}\n\n"
+                f"POINT CACHE requires: mesh/nurbsSurface shapes with animation\n"
+                f"WRONG: Selecting rig groups or control transforms\n"
+                f"RIGHT: Select the deformed geometry (geo/mesh_SHAPE)\n\n"
+                f"Try selecting: {self._suggest_geometry_path(members)}"
+            )
+
+        self.log.info(f"Exporting point cache for: {shapes_to_export}")
         self.log.debug(f"Frame range: {instance.data.get('frameStart', 1)}-{instance.data.get('frameEnd', 1)}")
         self.log.debug(f"Sampling: {sampling_mode} (step: {frame_step})")
 
@@ -155,15 +256,28 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             self.log.debug(f"Could not determine Maya USD version: {e}")
 
         self.log.debug(f"Export options: {options}")
+        self.log.debug(f"Exporting shapes: {shapes_to_export}")
 
         # Export USD with animation
         with maintained_selection():
-            cmds.select(members, replace=True, noExpand=True)
+            cmds.select(shapes_to_export, replace=True, noExpand=True)
             try:
                 cmds.mayaUSDExport(**options)
             except RuntimeError as e:
+                # Try to get the actual Maya error message
+                error_msg = str(e)
+                try:
+                    # Check Maya's command output for details
+                    mel_output = cmds.commandEcho(query=True)
+                    if mel_output:
+                        error_msg += f"\nMaya output: {mel_output}"
+                except:
+                    pass
+
+                self.log.error(f"Export failed with error: {error_msg}")
                 raise PublishValidationError(
-                    f"Failed to export USD animation cache: {e}"
+                    f"Failed to export USD point cache: {error_msg}\n"
+                    f"Exporting: {shapes_to_export}"
                 )
 
         if not os.path.exists(filepath):
