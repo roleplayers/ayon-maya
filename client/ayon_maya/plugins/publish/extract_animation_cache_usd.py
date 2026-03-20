@@ -306,10 +306,12 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
 
         if source_path == target_path:
             self.log.debug("Hierarchy already correct, no remapping needed")
-            # Even if no remap needed, we may still need resetXformStack
+            # Still need to sanitise the layer for override use
+            self._strip_material_bindings(layer, target_path)
+            self._convert_to_over_specifiers(layer, target_path)
             if reset_xform_stack:
                 self._apply_reset_xform_stack_sdf(layer, target_path)
-                layer.Save()
+            layer.Save()
             return
 
         self.log.info(f"Remapping hierarchy: {source_path} -> {target_path}")
@@ -318,12 +320,15 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         new_layer = Sdf.Layer.CreateAnonymous()
         self._copy_layer_metadata(layer, new_layer)
 
-        # Create parent Xform prims for the target path
+        # Create parent Xform prims for the target path.
+        # Use 'over' specifier — these prims already exist in the shot
+        # stage; we only need to provide the hierarchy anchor, not
+        # redefine them.
         prefixes = target_path.GetPrefixes()
         for prefix in prefixes[:-1]:
             if not new_layer.GetPrimAtPath(prefix):
                 prim_spec = Sdf.CreatePrimInLayer(new_layer, prefix)
-                prim_spec.specifier = Sdf.SpecifierDef
+                prim_spec.specifier = Sdf.SpecifierOver
                 prim_spec.typeName = "Xform"
 
         # Copy the asset subtree from source to target
@@ -338,6 +343,14 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
 
         # Clean up non-geometry prims (rig controls, materials, etc.)
         self._cleanup_non_geometry(new_layer, target_path)
+
+        # Strip material:binding relationships so the original asset's
+        # material assignments pass through the composition.
+        self._strip_material_bindings(new_layer, target_path)
+
+        # Convert all specifiers from 'def' to 'over' — this is an
+        # override layer, not a definition layer.
+        self._convert_to_over_specifiers(new_layer, target_path)
 
         # Apply resetXformStack before saving — all in-memory, no
         # layer-cache or mmap issues.
@@ -482,6 +495,75 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             if result:
                 return result
         return None
+
+    # ------------------------------------------------------------------
+    # Override-layer sanitisation
+    # ------------------------------------------------------------------
+
+    def _strip_material_bindings(self, layer, root_path):
+        """Remove ``material:binding`` relationships from all prims.
+
+        The Maya USD exporter authors ``material:binding`` on every Mesh
+        it writes.  When materials are later removed by
+        ``_cleanup_non_geometry``, these relationships point to
+        non-existent prims and — because a sublayer opinion is stronger
+        than a reference in LIVRPS — override the *valid* bindings that
+        come from the original asset.
+
+        Stripping them lets the original asset's material assignments
+        pass through the composition unmodified.
+        """
+        count = 0
+
+        def _strip(path):
+            nonlocal count
+            spec = layer.GetPrimAtPath(path)
+            if not spec:
+                return
+            # Collect material:binding* relationship names
+            to_remove = [
+                rel.name for rel in spec.relationships
+                if rel.name.startswith("material:binding")
+            ]
+            for name in to_remove:
+                spec.RemoveProperty(spec.relationships[name])
+                count += 1
+            for child_spec in spec.nameChildren:
+                _strip(path.AppendChild(child_spec.name))
+
+        _strip(root_path)
+        if count:
+            self.log.debug(
+                f"Stripped {count} material:binding relationship(s)"
+            )
+
+    def _convert_to_over_specifiers(self, layer, root_path):
+        """Change ``def`` specifiers to ``over`` on all prims.
+
+        A point-cache sublayer is an *override* layer: it only needs to
+        author the properties that differ from the original asset (e.g.
+        animated ``points``).  Using ``over`` instead of ``def`` means
+        that any property **not** authored here (materials, display
+        color, visibility, etc.) transparently passes through from the
+        weaker reference layer that holds the original asset.
+        """
+        # Convert the parent hierarchy prims (above the asset root)
+        for prefix in root_path.GetPrefixes():
+            spec = layer.GetPrimAtPath(prefix)
+            if spec and spec.specifier == Sdf.SpecifierDef:
+                spec.specifier = Sdf.SpecifierOver
+
+        def _convert(path):
+            spec = layer.GetPrimAtPath(path)
+            if not spec:
+                return
+            if spec.specifier == Sdf.SpecifierDef:
+                spec.specifier = Sdf.SpecifierOver
+            for child_spec in spec.nameChildren:
+                _convert(path.AppendChild(child_spec.name))
+
+        _convert(root_path)
+        self.log.debug("Converted all prim specifiers to 'over'")
 
     # ------------------------------------------------------------------
     # Non-geometry cleanup
