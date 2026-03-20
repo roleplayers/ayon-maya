@@ -414,7 +414,7 @@ options = {
     "exportSkin": "none",           # Sem skin clusters
     "exportBlendShapes": False,     # False for point cache (deformation already baked in points)
     "stripNamespaces": True,        # Remove namespaces Maya
-    "mergeTransformAndShape": False, # Mantem transform e shape separados
+    "mergeTransformAndShape": True,  # Merge para coincidir com asset original
     "exportDisplayColor": False,
     "exportVisibility": False,
     "exportColorSets": False,

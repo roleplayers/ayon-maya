@@ -148,7 +148,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             "exportSkin": "none",
             "exportBlendShapes": False,
             "stripNamespaces": creator_attrs.get("stripNamespaces", True),
-            "mergeTransformAndShape": False,
+            "mergeTransformAndShape": True,
             "exportDisplayColor": False,
             "exportVisibility": False,
             "exportColorSets": False,
