@@ -197,6 +197,39 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
 
         return list(set(shapes)) if shapes else []
 
+    def _filter_deformed_shapes(self, shapes):
+        """Filter out non-deformed shapes (e.g., ShapeOrig).
+
+        Keep only shapes that are actually deformed.
+        Removes:
+        - ShapeOrig (original non-deformed shape)
+        - Duplicate shapes
+        """
+        if not shapes:
+            return []
+
+        filtered = []
+        seen_base_names = set()
+
+        for shape in shapes:
+            # Skip "Orig" shapes - these are non-deformed originals
+            if shape.endswith("Orig") or "Orig" in shape:
+                self.log.debug(f"Skipping non-deformed shape: {shape}")
+                continue
+
+            # Get base name (without Shape suffix)
+            base_name = shape.replace("Shape", "").replace("Orig", "")
+
+            # Skip if we've already added this mesh (different variant)
+            if base_name in seen_base_names:
+                self.log.debug(f"Skipping duplicate shape: {shape}")
+                continue
+
+            filtered.append(shape)
+            seen_base_names.add(base_name)
+
+        return filtered
+
     def _suggest_geometry_path(self, nodes):
         """Show what was searched and suggest correct selection."""
         msg_lines = ["POINT CACHE requires: mesh/nurbsSurface shapes with animation"]
@@ -287,6 +320,10 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         # If members are transforms/groups, try to find shapes inside them
         shapes_to_export = self._find_geometry_shapes(members)
 
+        # Filter out non-deformed shapes (e.g., ShapeOrig)
+        # Keep only shapes that are actually deformed
+        shapes_to_export = self._filter_deformed_shapes(shapes_to_export)
+
         if not shapes_to_export:
             raise PublishValidationError(
                 f"No geometry found to export!\n"
@@ -313,7 +350,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             # CRITICAL: Skip rig/skeleton export - we only want geometry
             "exportSkels": "none",  # Don't export skeleton
             "exportSkin": "none",  # Don't export skin clusters
-            "exportBlendShapes": True,  # Export blend shapes if present
+            "exportBlendShapes": False,  # Don't export blend shapes (causes conflicts)
             # Other settings
             "stripNamespaces": creator_attrs.get("stripNamespaces", True),
             "mergeTransformAndShape": False,  # Keep transform and shape separate
