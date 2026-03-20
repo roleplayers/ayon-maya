@@ -412,7 +412,7 @@ options = {
     "frameStride": frame_step,      # 1.0 padrao, customizavel
     "exportSkels": "none",          # Sem skeleton
     "exportSkin": "none",           # Sem skin clusters
-    "exportBlendShapes": True,      # Blend shapes se existirem
+    "exportBlendShapes": False,     # False for point cache (deformation already baked in points)
     "stripNamespaces": True,        # Remove namespaces Maya
     "mergeTransformAndShape": False, # Mantem transform e shape separados
     "exportDisplayColor": False,

@@ -130,6 +130,12 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         self.log.debug(f"Sampling: {sampling_mode} (step: {frame_step})")
 
         # Prepare export options for POINT CACHE
+        # Note: exportBlendShapes is False because for a point cache we
+        # export the final deformed point positions (which already include
+        # blendshape deformation).  Enabling it would try to export the
+        # blendshape deformer *structure* as USD schema, which frequently
+        # fails on complex rigs (especially combined with stripNamespaces
+        # or selection-only exports) and is unnecessary for point caches.
         options = {
             "file": filepath,
             "selection": True,
@@ -140,7 +146,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             "frameStride": frame_step,
             "exportSkels": "none",
             "exportSkin": "none",
-            "exportBlendShapes": True,
+            "exportBlendShapes": False,
             "stripNamespaces": creator_attrs.get("stripNamespaces", True),
             "mergeTransformAndShape": False,
             "exportDisplayColor": False,
@@ -154,12 +160,14 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         }
 
         # Try to use worldspace if available (Maya USD 0.21.0+)
+        has_worldspace = False
         try:
             maya_usd_version = parse_version(
                 cmds.pluginInfo("mayaUsdPlugin", query=True, version=True)
             )
             if maya_usd_version >= (0, 21, 0):
                 options["worldspace"] = True
+                has_worldspace = True
             else:
                 self.log.debug(
                     f"Maya USD {maya_usd_version} < 0.21.0, no worldspace"
@@ -169,14 +177,52 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
 
         self.log.debug(f"Export options: {options}")
 
-        # Export USD with animation
+        # Build fallback strategies: progressively disable options that
+        # are known to cause failures on complex rigs / scenes.
+        fallbacks = [{}]  # first attempt: use options as-is
+        if has_worldspace:
+            # worldspace can conflict with certain deformer stacks
+            fallbacks.append({"worldspace": False})
+
+        # Export USD with animation (with fallback chain)
         with maintained_selection():
             cmds.select(members, replace=True, noExpand=True)
-            try:
-                cmds.mayaUSDExport(**options)
-            except RuntimeError as e:
+            last_error = None
+            for i, overrides in enumerate(fallbacks):
+                attempt_opts = dict(options, **overrides)
+                # Remove keys set to False that are flag-type
+                # (worldspace=False means "don't pass it at all")
+                if overrides.get("worldspace") is False:
+                    attempt_opts.pop("worldspace", None)
+                try:
+                    if i > 0:
+                        self.log.warning(
+                            f"Retrying export (attempt {i + 1}) "
+                            f"with overrides: {overrides}"
+                        )
+                        self.log.debug(
+                            f"Fallback export options: {attempt_opts}"
+                        )
+                    cmds.mayaUSDExport(**attempt_opts)
+                    if i > 0:
+                        self.log.warning(
+                            "Export succeeded with fallback options. "
+                            "Disabled: %s", list(overrides.keys())
+                        )
+                    last_error = None
+                    break
+                except RuntimeError as e:
+                    last_error = e
+                    self.log.warning(f"Export attempt {i + 1} failed: {e}")
+
+            if last_error is not None:
                 raise PublishValidationError(
-                    f"Failed to export USD animation cache: {e}"
+                    f"Failed to export USD animation cache after "
+                    f"{len(fallbacks)} attempt(s): {last_error}\n\n"
+                    f"This can happen with complex rigs. Try:\n"
+                    f"- Selecting only the geometry group (not the rig root)\n"
+                    f"- Checking for invalid mesh topology\n"
+                    f"- Ensuring all deformers evaluate correctly"
                 )
 
         if not os.path.exists(filepath):
