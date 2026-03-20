@@ -307,7 +307,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         if source_path == target_path:
             self.log.debug("Hierarchy already correct, no remapping needed")
             # Still need to sanitise the layer for override use
-            self._strip_geom_subsets(layer, target_path)
+            self._cleanup_non_geometry(layer, target_path)
             self._strip_material_bindings(layer, target_path)
             self._convert_to_over_specifiers(layer, target_path)
             if reset_xform_stack:
@@ -342,16 +342,13 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         # Set defaultPrim to the topmost prim
         new_layer.defaultPrim = prefixes[0].name
 
-        # Clean up non-geometry prims (rig controls, materials, etc.)
+        # Clean up non-geometry prims (rig controls, materials,
+        # GeomSubsets, etc.)
         self._cleanup_non_geometry(new_layer, target_path)
 
-        # Strip GeomSubsets — face-material assignments come from the
-        # original asset; the cache's copies carry namespace-mangled
-        # names that don't match and would create orphaned overs.
-        self._strip_geom_subsets(new_layer, target_path)
-
-        # Strip material:binding relationships so the original asset's
-        # material assignments pass through the composition.
+        # Strip material-related opinions (material:binding rels,
+        # subsetFamily:* attrs, MaterialBindingAPI from apiSchemas)
+        # so the original asset's assignments pass through.
         self._strip_material_bindings(new_layer, target_path)
 
         # Convert all specifiers from 'def' to 'over' — this is an
@@ -507,80 +504,69 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
     # ------------------------------------------------------------------
 
     def _strip_material_bindings(self, layer, root_path):
-        """Remove ``material:binding`` relationships from all prims.
+        """Remove all material-related opinions from the cache layer.
 
-        The Maya USD exporter authors ``material:binding`` on every Mesh
-        it writes.  When materials are later removed by
-        ``_cleanup_non_geometry``, these relationships point to
-        non-existent prims and — because a sublayer opinion is stronger
-        than a reference in LIVRPS — override the *valid* bindings that
-        come from the original asset.
+        The Maya USD exporter authors ``material:binding`` relationships,
+        ``MaterialBindingAPI`` in ``apiSchemas``, and ``subsetFamily:*``
+        attributes on Mesh prims.  After GeomSubset and Material prims
+        are removed by ``_cleanup_non_geometry``, these become broken
+        opinions that — because sublayer > reference in LIVRPS —
+        override the *valid* bindings from the original asset.
 
         Stripping them lets the original asset's material assignments
         pass through the composition unmodified.
         """
-        count = 0
+        stripped = 0
 
         def _strip(path):
-            nonlocal count
+            nonlocal stripped
             spec = layer.GetPrimAtPath(path)
             if not spec:
                 return
-            # Collect material:binding* relationship names
-            to_remove = [
+
+            # 1. Remove material:binding* relationships
+            rels_to_remove = [
                 rel.name for rel in spec.relationships
                 if rel.name.startswith("material:binding")
             ]
-            for name in to_remove:
+            for name in rels_to_remove:
                 spec.RemoveProperty(spec.relationships[name])
-                count += 1
+                stripped += 1
+
+            # 2. Remove subsetFamily:* attributes (orphaned after
+            #    GeomSubset removal, e.g. subsetFamily:materialBind:*)
+            attrs_to_remove = [
+                attr.name for attr in spec.attributes
+                if attr.name.startswith("subsetFamily:")
+            ]
+            for name in attrs_to_remove:
+                spec.RemoveProperty(spec.attributes[name])
+                stripped += 1
+
+            # 3. Remove MaterialBindingAPI from apiSchemas
+            api_attr = spec.GetInfo("apiSchemas")
+            if api_attr:
+                cleaned = [
+                    s for s in api_attr.GetAddedOrExplicitItems()
+                    if s != "MaterialBindingAPI"
+                ]
+                if len(cleaned) < len(api_attr.GetAddedOrExplicitItems()):
+                    if cleaned:
+                        spec.SetInfo(
+                            "apiSchemas",
+                            Sdf.TokenListOp.CreateExplicit(cleaned),
+                        )
+                    else:
+                        spec.ClearInfo("apiSchemas")
+                    stripped += 1
+
             for child_spec in spec.nameChildren:
                 _strip(path.AppendChild(child_spec.name))
 
         _strip(root_path)
-        if count:
+        if stripped:
             self.log.debug(
-                f"Stripped {count} material:binding relationship(s)"
-            )
-
-    def _strip_geom_subsets(self, layer, root_path):
-        """Remove all ``GeomSubset`` prims from the cache layer.
-
-        GeomSubsets define per-face material assignments (shading
-        groups).  In a point-cache override layer they are unnecessary
-        — the original asset already carries the correct face-set
-        definitions.
-
-        Worse, when the geometry is inside a rig with a namespace (e.g.
-        ``rigMain:``), ``stripNamespaces`` only strips DAG node names
-        but converts the ``:`` in shading-group names to ``_``.  This
-        produces GeomSubset names like
-        ``rigMain_cc5mat_SG_Std_Skin_Body`` which do not match the
-        original asset's ``cc5mat_SG_Std_Skin_Body``, leaving orphaned
-        ``over`` prims in the cache.
-        """
-        to_remove = []
-
-        def _collect(path):
-            spec = layer.GetPrimAtPath(path)
-            if not spec:
-                return
-            for child_spec in list(spec.nameChildren):
-                child_path = path.AppendChild(child_spec.name)
-                if child_spec.typeName == "GeomSubset":
-                    to_remove.append(child_path)
-                else:
-                    _collect(child_path)
-
-        _collect(root_path)
-
-        if to_remove:
-            edit = Sdf.BatchNamespaceEdit()
-            for path in reversed(to_remove):
-                edit.Add(path, Sdf.Path.emptyPath)
-            layer.Apply(edit)
-            self.log.debug(
-                f"Stripped {len(to_remove)} GeomSubset prim(s)"
+                f"Stripped {stripped} material-related opinion(s)"
             )
 
     def _convert_to_over_specifiers(self, layer, root_path):
@@ -623,11 +609,13 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         - BasisCurves (rig control shapes)
         - Material / Shader / NodeGraph prims
         - MayaReference prims
+        - GeomSubset prims (face-material assignments come from the
+          original asset; the cache copies carry namespace-mangled names)
         - Empty Xform/Scope containers with no geometry descendants
         """
         non_geo_types = {
             "BasisCurves", "Material", "Shader",
-            "NodeGraph", "MayaReference",
+            "NodeGraph", "MayaReference", "GeomSubset",
         }
 
         # Pass 1: collect non-geometry typed prims
@@ -660,7 +648,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
     def _remove_empty_containers(self, layer, root_path):
         """Remove Xform/Scope prims that have no geometry descendants."""
         geo_types = {
-            "Mesh", "GeomSubset", "Points",
+            "Mesh", "Points",
             "NurbsPatch", "PointInstancer",
         }
 
