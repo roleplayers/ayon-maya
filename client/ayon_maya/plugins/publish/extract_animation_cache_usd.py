@@ -352,7 +352,8 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             "exportSkin": "none",  # Don't export skin clusters
             "exportBlendShapes": False,  # Don't export blend shapes (causes conflicts)
             # Other settings
-            "stripNamespaces": creator_attrs.get("stripNamespaces", True),
+            # IMPORTANT: Keep namespaces - shot hierarchy needs them!
+            "stripNamespaces": False,  # was: creator_attrs.get("stripNamespaces", True)
             "mergeTransformAndShape": False,  # Keep transform and shape separate
             "exportDisplayColor": False,
             "exportVisibility": False,
