@@ -130,8 +130,8 @@ stage:
 ### Fluxo de Load
 
 ```python
-# 1. Determinar stage (prioridade acima)
-stage = ...
+# 1. Determinar stage e proxy_shape (prioridade acima)
+stage, proxy_shape = ...
 
 # 2. Resolver prim path baseado no modo escolhido
 prim_path = _resolve_prim_path(context, options)
@@ -143,15 +143,36 @@ _define_prim_hierarchy(stage, prim_path)
 reference = Sdf.Reference(assetPath=path, customData=identifier_data)
 prim.GetReferences().AddReference(reference)
 
-# 5. Containerizar o prim (metadata AYON)
+# 5. Containerizar o prim (metadata AYON no USD)
 containerise_prim(prim, name, namespace, context, loader)
+
+# 6. Criar container Maya (objectSet) para Scene Inventory
+container_node = containerise(name, namespace, [proxy_shape], context, loader)
+
+# 7. Armazenar prim path e proxy shape no objectSet
+cmds.addAttr(container_node, longName="usd_prim_path", ...)
+cmds.addAttr(container_node, longName="usd_proxy_shape", ...)
 ```
 
-### Metadata de Container (customData no prim)
+### Integracao com Scene Inventory
 
-Quando uma referencia e adicionada, os seguintes dados sao escritos no
-prim como `customData`:
+O loader cria **dois niveis de container**:
 
+1. **USD prim customData** - metadados no prim para compatibilidade com o
+   collector do animation cache (`stage.Traverse()` + `GetCustomDataByKey`)
+2. **Maya objectSet** - container Maya padrao para integracao com o
+   Scene Inventory do AYON (versionamento, notificacoes de desatualizados)
+
+O objectSet armazena dois atributos extras:
+- `usd_prim_path`: caminho do prim no stage USD (ex: `/assets/character/cone`)
+- `usd_proxy_shape`: DAG path do proxy shape que contem o stage
+
+Isso permite que `update()` e `remove()` recuperem o prim USD a partir
+do container Maya retornado pelo Scene Inventory.
+
+### Metadata de Container
+
+**USD Prim customData:**
 ```python
 {
     "ayon:schema": "openpype:container-2.0",
@@ -163,18 +184,26 @@ prim como `customData`:
 }
 ```
 
-Esses dados sao fundamentais para:
-- O Scene Manager do AYON rastrear versoes
-- O collector do animation cache detectar o `originalAssetPrimPath`
-  automaticamente
-- Update/Switch/Remove de assets no stage
+**Maya objectSet attributes:**
+```
+schema: "openpype:container-2.0"
+id: AVALON_CONTAINER_ID
+name: "cone_character"
+namespace: "cone_character_01_"
+loader: "MayaUsdProxyReferenceUsd"
+representation: "<representation_id>"
+usd_prim_path: "/assets/character/cone_character"
+usd_proxy_shape: "|stage1|stageShape1"
+```
 
 ### Update / Switch / Remove
 
-- **Update**: Itera pelo prim stack, encontra a referencia antiga e
-  substitui o `assetPath` mantendo `customData`, `layerOffset` e `primPath`
+- **Update**: Recebe o container Maya (objectSet) do Scene Inventory,
+  recupera o prim USD via `usd_prim_path` + `usd_proxy_shape`, atualiza
+  a referencia USD e o `representation` no objectSet
 - **Switch**: Chama `update()` diretamente
-- **Remove**: Remove todas as references do prim e limpa customData
+- **Remove**: Recupera o prim, remove as references USD e limpa customData.
+  Deleta apenas o objectSet, **nao** o proxy shape (que e compartilhado)
 
 ---
 

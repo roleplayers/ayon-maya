@@ -5,6 +5,8 @@ import uuid
 import qargparse
 from ayon_core.pipeline import load
 from ayon_core.pipeline.load import get_representation_path_from_context
+from ayon_maya.api.pipeline import containerise
+from ayon_maya.api.lib import unique_namespace
 from ayon_maya.api.usdlib import (
     containerise_prim,
     iter_ufe_usd_selection
@@ -397,6 +399,7 @@ class MayaUsdProxyReferenceUsd(load.LoaderPlugin):
 
         options = options or {}
         stage = None
+        proxy_shape = None
         base_prim = None
 
         # Priority 1: USD prim selected via UFE - use as base for hierarchy
@@ -405,9 +408,10 @@ class MayaUsdProxyReferenceUsd(load.LoaderPlugin):
             assert len(ufe_selection) == 1, "Select only one USD prim please"
             base_prim = mayaUsd.ufe.ufePathToPrim(ufe_selection[0])
             if base_prim and base_prim.IsValid():
-                # Get the stage from the selected prim
                 from pxr import Usd
                 stage = base_prim.GetStage()
+                # Find which proxy shape owns this stage
+                proxy_shape = self._find_proxy_for_stage(stage)
 
         # Priority 2: mayaUsdProxyShape (or its transform) is selected
         if stage is None:
@@ -417,11 +421,11 @@ class MayaUsdProxyReferenceUsd(load.LoaderPlugin):
 
         # Priority 3: no selection - find any proxy stage in the scene
         if stage is None:
-            _shape, stage = _find_any_proxy_stage()
+            proxy_shape, stage = _find_any_proxy_stage()
 
         # Priority 4: no proxy in scene - create one
         if stage is None:
-            _shape, stage = _create_new_proxy_stage()
+            proxy_shape, stage = _create_new_proxy_stage()
 
         # Resolve the prim path using the chosen mode
         mode = options.get("prim_path_mode", 0)
@@ -479,7 +483,8 @@ class MayaUsdProxyReferenceUsd(load.LoaderPlugin):
         if not success:
             raise RuntimeError("Failed to add reference")
 
-        container = containerise_prim(
+        # Store metadata on USD prim (for animation cache collector compat)
+        containerise_prim(
             prim,
             name=name,
             namespace=namespace or "",
@@ -487,13 +492,41 @@ class MayaUsdProxyReferenceUsd(load.LoaderPlugin):
             loader=self.__class__.__name__
         )
 
-        return container
+        # Create Maya objectSet container for Scene Inventory integration
+        folder_name = context["folder"]["name"]
+        namespace = namespace or unique_namespace(
+            folder_name + "_",
+            prefix="_" if folder_name[0].isdigit() else "",
+            suffix="_",
+        )
+
+        container_node = containerise(
+            name=name,
+            namespace=namespace,
+            nodes=[proxy_shape],
+            context=context,
+            loader=self.__class__.__name__
+        )
+
+        # Store USD prim path and proxy shape for update/remove
+        cmds.addAttr(container_node, longName="usd_prim_path",
+                     dataType="string")
+        cmds.setAttr(container_node + ".usd_prim_path",
+                     str(prim.GetPath()), type="string")
+        cmds.addAttr(container_node, longName="usd_proxy_shape",
+                     dataType="string")
+        cmds.setAttr(container_node + ".usd_proxy_shape",
+                     proxy_shape, type="string")
+
+        return container_node
 
     def update(self, container, context):
         # type: (dict, dict) -> None
         from pxr import Sdf
 
-        prim = container["prim"]
+        node = container["objectName"]
+        prim = self._get_prim_from_container(node)
+
         path = self.filepath_from_context(context)
         for references, index in self._get_prim_references(prim):
             reference = references[index]
@@ -505,22 +538,69 @@ class MayaUsdProxyReferenceUsd(load.LoaderPlugin):
             )
             references[index] = new_reference
 
+        # Update USD prim metadata
         prim.SetCustomDataByKey(
             "ayon:representation", context["representation"]["id"]
         )
+
+        # Update Maya objectSet representation
+        cmds.setAttr(node + ".representation",
+                     context["representation"]["id"], type="string")
 
     def switch(self, container, context):
         self.update(container, context)
 
     def remove(self, container):
         # type: (dict) -> None
-        prim = container["prim"]
+        node = container["objectName"]
 
-        related_references = reversed(list(self._get_prim_references(prim)))
-        for references, index in related_references:
-            references.remove(references[index])
+        # Remove USD references from the prim
+        try:
+            prim = self._get_prim_from_container(node)
+            related_refs = reversed(list(self._get_prim_references(prim)))
+            for references, index in related_refs:
+                references.remove(references[index])
+            prim.ClearCustomDataByKey("ayon")
+        except (RuntimeError, KeyError):
+            pass  # Prim or stage may already be gone
 
-        prim.ClearCustomDataByKey("ayon")
+        # Delete the objectSet only, NOT the proxy shape (it's shared)
+        if cmds.objExists(node):
+            cmds.delete(node)
+
+    def _get_prim_from_container(self, node):
+        """Recover the USD prim from a Maya container objectSet."""
+        prim_path = cmds.getAttr(node + ".usd_prim_path")
+        proxy_shape = cmds.getAttr(node + ".usd_proxy_shape")
+
+        if not cmds.objExists(proxy_shape):
+            raise RuntimeError(
+                "Proxy shape '{}' no longer exists".format(proxy_shape)
+            )
+
+        stage = _get_stage_from_proxy_shape(proxy_shape)
+        if not stage:
+            raise RuntimeError(
+                "Could not get USD stage from '{}'".format(proxy_shape)
+            )
+
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid():
+            raise RuntimeError(
+                "USD prim '{}' no longer exists".format(prim_path)
+            )
+
+        return prim
+
+    @staticmethod
+    def _find_proxy_for_stage(stage):
+        """Find the mayaUsdProxyShape that owns the given USD stage."""
+        shapes = cmds.ls(type="mayaUsdProxyShape", long=True) or []
+        for shape in shapes:
+            shape_stage = _get_stage_from_proxy_shape(shape)
+            if shape_stage and shape_stage == stage:
+                return shape
+        return None
 
     def _get_prim_references(self, prim):
         for prim_spec in prim.GetPrimStack():
