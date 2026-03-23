@@ -9,17 +9,21 @@ Workflow:
 2. Animate the geometry
 3. Create animationCacheUsd instance
 4. Publish to generate:
-   - animation_cache.usda: Sparse animation data
-   - animation_contribution.usda: Override layer for shot USD composition
+   - animation_cache.usd: Sparse animation data with animated points
 
 Multi-asset support:
 When "Split per Asset" is enabled and multiple assets are selected, the
 creator automatically groups members by their Maya namespace (each
 loaded USD asset gets its own namespace) and creates one publish
-instance per asset. Each instance is named with the asset identifier
+instance per asset.  Each instance is named with the asset identifier
 so that individual cache layers can be updated independently — useful
 when CFX/FX need to iterate on specific characters in a multi-character
 shot.
+
+When "Split per Asset" is disabled, all selected geometry is exported
+into a single cache.  The extractor and collector handle multiple
+assets in a single instance by detecting all prim paths and remapping
+every asset subtree into the output layer.
 """
 
 from ayon_maya.api import plugin, lib
@@ -29,49 +33,7 @@ from ayon_core.lib import (
     NumberDef,
     TextDef
 )
-from ayon_core.pipeline.create import CreatorError
 from maya import cmds
-
-
-def _detect_department_from_context(create_context):
-    """Detect department from the current AYON task context.
-
-    Checks both task name and task type against known department
-    mappings. Returns the matching department string or ``"auto"``
-    if nothing matches.
-
-    Args:
-        create_context: The AYON create context.
-
-    Returns:
-        str: Detected department or "auto".
-    """
-    try:
-        task_entity = create_context.get_current_task_entity()
-        if not task_entity:
-            return "auto"
-
-        task_name = (task_entity.get("name") or "").lower()
-        task_type = (task_entity.get("taskType") or "").lower()
-
-        dept_mapping = {
-            "anim": "animation",
-            "animation": "animation",
-            "layout": "layout",
-            "cfx": "cfx",
-            "fx": "fx",
-        }
-
-        # Check task name first, then task type
-        for source in (task_name, task_type):
-            for key, dept in dept_mapping.items():
-                if key in source:
-                    return dept
-
-    except Exception:
-        pass
-
-    return "auto"
 
 
 def _group_members_by_namespace(members):
@@ -99,6 +61,61 @@ def _group_members_by_namespace(members):
             ns = ""
         groups.setdefault(ns, []).append(member)
     return groups
+
+
+def _expand_to_geometry(members):
+    """Expand parent transforms to include descendant mesh geometry.
+
+    When a user selects a parent group or rig root, this finds all
+    mesh shapes underneath and returns their parent transforms.  This
+    ensures the export captures the actual deformed geometry even when
+    the user selects a high-level node.
+
+    If the selection already contains mesh shapes or their transforms,
+    they are kept as-is.
+
+    Args:
+        members (list[str]): Long DAG paths from selection.
+
+    Returns:
+        list[str]: Expanded list including descendant mesh transforms.
+    """
+    # Check if any selected node is already a mesh (or mesh transform)
+    has_mesh = False
+    for member in members:
+        shapes = cmds.listRelatives(
+            member, shapes=True, type="mesh", fullPath=True
+        ) or []
+        if shapes:
+            has_mesh = True
+            break
+        # Check if member itself is a mesh shape
+        if cmds.nodeType(member) == "mesh":
+            has_mesh = True
+            break
+
+    if has_mesh:
+        # Selection already contains meshes, use as-is
+        return members
+
+    # Selection has no meshes — expand: find all mesh descendants
+    expanded = set()
+    for member in members:
+        meshes = cmds.listRelatives(
+            member, allDescendents=True, type="mesh", fullPath=True
+        ) or []
+        if meshes:
+            # Get parent transforms of mesh shapes
+            transforms = cmds.listRelatives(
+                meshes, parent=True, fullPath=True
+            ) or []
+            expanded.update(transforms)
+
+    if expanded:
+        return list(expanded)
+
+    # Nothing found — return original (let validator handle the error)
+    return members
 
 
 class CreateAnimationCacheUsd(plugin.MayaCreator):
@@ -172,27 +189,6 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         )
         defs.append(custom_step_def)
 
-        # Department/layer selection — default to auto-detected value
-        detected_dept = _detect_department_from_context(self.create_context)
-        defs.append(
-            EnumDef("department",
-                    label="Department",
-                    items={
-                        "auto": "Auto-detect from task",
-                        "animation": "Animation",
-                        "layout": "Layout",
-                        "cfx": "CFX",
-                        "fx": "FX"
-                    },
-                    default=detected_dept,
-                    tooltip=(
-                        "Department layer for the USD contribution.\n"
-                        "The default is auto-detected from the current "
-                        "AYON task context so that animation exports to "
-                        "the animation layer, layout to layout, etc."
-                    ))
-        )
-
         # Asset prim path input (fallback if auto-detection fails)
         defs.append(
             TextDef("originalAssetPrimPath",
@@ -258,6 +254,10 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         created per namespace (i.e. per loaded asset).  Each instance
         receives the subset of members that belong to that asset, and
         its product name is suffixed with the asset identifier.
+
+        Selected parent transforms are automatically expanded to their
+        descendant mesh geometry so the user can select rig roots or
+        asset groups without worrying about picking exact mesh nodes.
         """
 
         members = cmds.ls(selection=True, long=True, type="dagNode")
@@ -267,16 +267,21 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
                 "No nodes selected for animation cache export. "
                 "Please select the animated geometry."
             )
-            # Fall through to create an empty instance (user can add
-            # members later via the publisher UI).
             return super().create(
                 product_name, instance_data, pre_create_data
             )
 
+        # Expand parent transforms to include descendant geometry
+        members = _expand_to_geometry(members)
+        self.log.debug(
+            f"Members after geometry expansion: {len(members)} nodes"
+        )
+
         split_per_asset = pre_create_data.get("splitPerAsset", True)
 
         if not split_per_asset:
-            # Single instance with all members
+            # Single instance with all members — select them and delegate
+            cmds.select(members, replace=True, noExpand=True)
             return super().create(
                 product_name, instance_data, pre_create_data
             )
@@ -285,7 +290,8 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         groups = _group_members_by_namespace(members)
 
         # If there's only one group, no split needed
-        if len(groups) == 1:
+        if len(groups) <= 1:
+            cmds.select(members, replace=True, noExpand=True)
             return super().create(
                 product_name, instance_data, pre_create_data
             )
@@ -296,9 +302,6 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
             f"{list(groups.keys())}"
         )
 
-        # Detect department once for all instances
-        detected_dept = _detect_department_from_context(self.create_context)
-
         project_name = self.create_context.get_current_project_name()
         folder_entity = self.create_context.get_current_folder_entity()
         task_entity = self.create_context.get_current_task_entity()
@@ -307,7 +310,6 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         for namespace, ns_members in sorted(groups.items()):
             # Derive a clean asset label from the namespace
             asset_label = namespace if namespace else "default"
-            # Clean the label for use in product names (remove special chars)
             asset_variant = asset_label.replace(":", "_").replace(" ", "_")
 
             # Build variant: original variant + asset name
@@ -346,5 +348,6 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         # Restore original selection
         cmds.select(members, replace=True, noExpand=True)
 
-        # Return the last created instance (AYON expects a single return)
+        # Return the last created instance (all are registered via
+        # _add_instance_to_context inside super().create())
         return instances[-1] if instances else None

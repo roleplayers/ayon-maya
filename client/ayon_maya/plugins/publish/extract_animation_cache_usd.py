@@ -16,6 +16,13 @@ The workflow:
 3. Post-process to remap hierarchy to match original asset prim path
 4. Result: Clean point cache with correct hierarchy for sublayer composition
 
+Multi-asset support:
+When the instance contains members from multiple assets (namespaces),
+the collector provides ``allAssetPrimPaths`` — a dict mapping each
+namespace to its USD prim path in the shot stage.  The extractor
+remaps *all* matched assets into a single output layer so that the
+cache covers every selected character.
+
 Usage:
 - Select: /assets/character/cone_character/geo/cone_character_GEO (or similar)
 - Publish with animationCacheUsd family
@@ -59,7 +66,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         self.log.info("Exporting animation cache USD (point cache)...")
         cache_file = self._export_animation_cache(instance, staging_dir)
 
-        # 2. Remap hierarchy to match original asset prim path
+        # 2. Remap hierarchy to match original asset prim path(s)
         #    and optionally apply !resetXformStack! to prevent
         #    double-transforms from layout positioning.
         creator_attrs = instance.data.get("creator_attributes", {})
@@ -122,7 +129,8 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                 f"No members to export for {instance.name}"
             )
 
-        self.log.info(f"Exporting point cache for: {members}")
+        self.log.info(f"Exporting point cache for {len(members)} members")
+        self.log.debug(f"Members: {members}")
         self.log.debug(
             f"Frame range: {instance.data.get('frameStart', 1)}"
             f"-{instance.data.get('frameEnd', 1)}"
@@ -239,28 +247,16 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
 
     def _remap_to_asset_hierarchy(self, filepath, instance,
                                   reset_xform_stack=False):
-        """Remap exported USD hierarchy to match original asset prim path.
+        """Remap exported USD hierarchy to match original asset prim paths.
 
-        When exporting geometry from 'Edit as Maya Data', the Maya USD
-        exporter preserves the internal Maya scene hierarchy, producing
-        paths like::
+        Supports **multiple assets** in a single export.  The collector
+        provides ``allAssetPrimPaths`` (a dict mapping namespace →
+        prim path) when the instance's members span several loaded
+        assets.  Each matched asset subtree is copied to its correct
+        target path in the output layer.
 
-            /__mayaUsd__/rigParent/rig/<asset>/geo/mesh
-
-        For the LayCache sublayer to compose correctly over the original
-        asset in the shot stage, the hierarchy must match the original
-        prim path, e.g.::
-
-            /usdShot/assets/character/<asset>/geo/mesh
-
-        This method:
-        1. Finds the asset prim in the exported hierarchy by name
-        2. Creates a new layer with the correct target hierarchy
-        3. Copies the geometry subtree to the correct location
-        4. Cleans up non-geometry prims (rig controls, materials)
-        5. Optionally applies ``!resetXformStack!`` to the asset prim
-           and its geometry children (to prevent double-transforms when
-           the cache was exported with ``worldspace=True``)
+        When only a single ``originalAssetPrimPath`` is available, the
+        method falls back to single-asset behaviour.
 
         All operations happen on an in-memory ``Sdf.Layer`` before a
         single ``Export()`` to disk, which avoids layer-cache / mmap
@@ -270,10 +266,17 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             filepath: Path to the exported USD file.
             instance: Publish instance.
             reset_xform_stack: If True, add ``!resetXformStack!`` to the
-                asset root prim and its geometry children.
+                asset root prims and their geometry children.
         """
-        original_path = instance.data.get("originalAssetPrimPath", "")
-        if not original_path:
+
+        # Gather target prim paths — prefer the multi-asset dict
+        all_paths = instance.data.get("allAssetPrimPaths", {})
+        if not all_paths:
+            single = instance.data.get("originalAssetPrimPath", "")
+            if single:
+                all_paths = {"_single": single}
+
+        if not all_paths:
             self.log.warning(
                 "No originalAssetPrimPath available. "
                 "Cannot remap LayCache hierarchy. The exported USD will "
@@ -282,31 +285,30 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             )
             return
 
-        target_path = Sdf.Path(original_path)
-        asset_name = target_path.name
-
         layer = Sdf.Layer.FindOrOpen(filepath)
         if not layer:
             self.log.error(f"Could not open exported USD: {filepath}")
             return
 
-        # Find the asset prim in the exported hierarchy
-        source_path = self._find_prim_by_name(layer, asset_name)
-
-        # Fallback: try namespace-suffixed match (when stripNamespaces=False)
-        if not source_path:
-            source_path = self._find_prim_by_name_suffix(layer, asset_name)
-
-        if not source_path:
-            self.log.warning(
-                f"Could not find prim '{asset_name}' in exported USD. "
-                "Hierarchy remapping skipped."
+        # ---- Check if ALL target paths already exist in the exported
+        #      layer (no remapping needed) ----
+        all_already_correct = True
+        for target_str in all_paths.values():
+            target_path = Sdf.Path(target_str)
+            asset_name = target_path.name
+            source = (
+                self._find_prim_by_name(layer, asset_name)
+                or self._find_prim_by_name_suffix(layer, asset_name)
             )
-            return
+            if source != target_path:
+                all_already_correct = False
+                break
 
-        if source_path == target_path:
-            self.log.debug("Hierarchy already correct, no remapping needed")
-            # Still need to sanitise the layer for override use
+        if all_already_correct and len(all_paths) == 1:
+            target_path = Sdf.Path(next(iter(all_paths.values())))
+            self.log.debug(
+                "Hierarchy already correct, no remapping needed"
+            )
             self._cleanup_non_geometry(layer, target_path)
             self._strip_material_bindings(layer, target_path)
             self._convert_to_over_specifiers(layer, target_path)
@@ -315,55 +317,80 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             layer.Save()
             return
 
-        self.log.info(f"Remapping hierarchy: {source_path} -> {target_path}")
-
-        # Build new layer with correct hierarchy
+        # ---- Build a new layer with all assets remapped ----
         new_layer = Sdf.Layer.CreateAnonymous()
         self._copy_layer_metadata(layer, new_layer)
 
-        # Create parent Xform prims for the target path.
-        # Use 'over' specifier — these prims already exist in the shot
-        # stage; we only need to provide the hierarchy anchor, not
-        # redefine them.
-        prefixes = target_path.GetPrefixes()
-        for prefix in prefixes[:-1]:
-            if not new_layer.GetPrimAtPath(prefix):
-                prim_spec = Sdf.CreatePrimInLayer(new_layer, prefix)
-                prim_spec.specifier = Sdf.SpecifierOver
-                prim_spec.typeName = "Xform"
+        first_root_name = None
+        remapped_count = 0
 
-        # Copy the asset subtree from source to target
-        if not Sdf.CopySpec(layer, source_path, new_layer, target_path):
+        for ns, target_str in all_paths.items():
+            target_path = Sdf.Path(target_str)
+            asset_name = target_path.name
+
+            # Find the asset prim in the exported hierarchy
+            source_path = self._find_prim_by_name(layer, asset_name)
+            if not source_path:
+                source_path = self._find_prim_by_name_suffix(
+                    layer, asset_name
+                )
+
+            if not source_path:
+                self.log.warning(
+                    f"Could not find prim '{asset_name}' (namespace "
+                    f"'{ns}') in exported USD. Skipping this asset."
+                )
+                continue
+
+            self.log.info(
+                f"Remapping asset '{asset_name}': "
+                f"{source_path} -> {target_path}"
+            )
+
+            # Create parent Xform prims (with 'over' specifier).
+            prefixes = target_path.GetPrefixes()
+            for prefix in prefixes[:-1]:
+                if not new_layer.GetPrimAtPath(prefix):
+                    prim_spec = Sdf.CreatePrimInLayer(new_layer, prefix)
+                    prim_spec.specifier = Sdf.SpecifierOver
+                    prim_spec.typeName = "Xform"
+
+            # Copy the asset subtree from source to target
+            if not Sdf.CopySpec(
+                layer, source_path, new_layer, target_path
+            ):
+                self.log.error(
+                    f"Failed to copy prim specs: "
+                    f"{source_path} -> {target_path}"
+                )
+                continue
+
+            # Sanitise this asset's subtree
+            self._cleanup_non_geometry(new_layer, target_path)
+            self._strip_material_bindings(new_layer, target_path)
+            self._convert_to_over_specifiers(new_layer, target_path)
+            if reset_xform_stack:
+                self._apply_reset_xform_stack_sdf(new_layer, target_path)
+
+            if first_root_name is None:
+                first_root_name = prefixes[0].name
+            remapped_count += 1
+
+        if remapped_count == 0:
             self.log.error(
-                f"Failed to copy prim specs: {source_path} -> {target_path}"
+                "No assets could be remapped. The exported USD will "
+                "keep its original hierarchy."
             )
             return
 
         # Set defaultPrim to the topmost prim
-        new_layer.defaultPrim = prefixes[0].name
+        if first_root_name:
+            new_layer.defaultPrim = first_root_name
 
-        # Clean up non-geometry prims (rig controls, materials,
-        # GeomSubsets, etc.)
-        self._cleanup_non_geometry(new_layer, target_path)
-
-        # Strip material-related opinions (material:binding rels,
-        # subsetFamily:* attrs, MaterialBindingAPI from apiSchemas)
-        # so the original asset's assignments pass through.
-        self._strip_material_bindings(new_layer, target_path)
-
-        # Convert all specifiers from 'def' to 'over' — this is an
-        # override layer, not a definition layer.
-        self._convert_to_over_specifiers(new_layer, target_path)
-
-        # Apply resetXformStack before saving — all in-memory, no
-        # layer-cache or mmap issues.
-        if reset_xform_stack:
-            self._apply_reset_xform_stack_sdf(new_layer, target_path)
-
-        # Save the remapped layer (single write to disk)
         new_layer.Export(filepath)
         self.log.info(
-            f"Hierarchy remapped successfully: {source_path} -> {target_path}"
+            f"Hierarchy remapped successfully for "
+            f"{remapped_count} asset(s)"
         )
 
     def _apply_reset_xform_stack_sdf(self, layer, root_path):

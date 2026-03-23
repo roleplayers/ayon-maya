@@ -2,9 +2,15 @@
 
 This collector enriches the animation cache USD instance with:
 - Animation frame range and sampling settings
-- Original asset prim path (auto-detected from containers)
+- Original asset prim path(s) (auto-detected from containers)
 - Department/layer information from task context
 - Animated members from the instance
+
+Multi-asset support:
+When the instance's ``setMembers`` span multiple Maya namespaces (i.e.
+multiple loaded USD assets), the collector detects a prim path for
+**each** namespace and stores them in ``allAssetPrimPaths``.  The
+extractor uses this dict to remap every asset in a single pass.
 """
 
 import maya.cmds as cmds
@@ -18,7 +24,7 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
 
     Prepares instance data for animation cache USD publishing by:
     1. Validating animated members exist
-    2. Detecting original asset prim path from loaded containers
+    2. Detecting original asset prim path(s) from loaded containers
     3. Setting up animation frame range and sampling
     4. Determining department from task context
     """
@@ -38,20 +44,34 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
                 "Please select the animated nodes."
             )
 
-        # 2. Detect original asset prim path via smart detection
-        #    Try: container metadata → UFE selection → manual input
-        asset_prim_path = self._detect_asset_prim_path(instance)
-        if not asset_prim_path:
+        # 2. Detect original asset prim path(s) via smart detection
+        #    Builds a dict {namespace: prim_path} for all member assets.
+        all_paths, containers = self._detect_all_asset_prim_paths(
+            instance
+        )
+        instance.data["allAssetPrimPaths"] = all_paths
+
+        # Keep single-path key for backward compat / logging
+        if all_paths:
+            first_path = next(iter(all_paths.values()))
+            instance.data["originalAssetPrimPath"] = first_path
+        else:
+            # Try single-asset fallback (manual input or UFE)
+            single = self._detect_asset_prim_path_fallback(instance)
+            instance.data["originalAssetPrimPath"] = single
+            if single:
+                all_paths["_single"] = single
+                instance.data["allAssetPrimPaths"] = all_paths
+
+        if not all_paths:
             self.log.warning(
-                f"Could not auto-detect asset prim path for {instance.name}. "
-                "The contribution layer may not be placed correctly. "
-                "Set 'Original Asset Prim Path' manually if auto-detection "
-                "fails."
+                f"Could not auto-detect asset prim path for "
+                f"{instance.name}. The contribution layer may not be "
+                f"placed correctly. Set 'Original Asset Prim Path' "
+                f"manually if auto-detection fails."
             )
 
-        instance.data["originalAssetPrimPath"] = asset_prim_path
-
-        # 3. Detect department from task context or use override
+        # 3. Detect department from task context
         department = self._detect_department(instance)
         instance.data["departmentLayer"] = department
 
@@ -66,27 +86,75 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
         # 5. Log collected information
         self.log.info(
             f"Collected animation cache USD: "
-            f"prim_path={asset_prim_path}, "
+            f"assets={list(all_paths.keys())}, "
             f"department={department}, "
             f"sampling={sampling_mode}, "
             f"members={len(set_members)}"
         )
 
-    def _detect_asset_prim_path(self, instance):
-        """Detect original asset prim path via smart detection.
+    # ------------------------------------------------------------------
+    # Multi-asset prim path detection
+    # ------------------------------------------------------------------
 
-        Strategy order:
-        1. Manual input from creator attributes (user override)
-        2. Match setMembers namespaces against USD container prims
-        3. UFE prim selection fallback
+    def _detect_all_asset_prim_paths(self, instance):
+        """Detect prim paths for ALL assets represented in the instance.
+
+        Groups members by Maya namespace, then matches each namespace
+        against USD containers in the scene.
 
         Returns:
-            str: Detected prim path or empty string if not found
+            tuple: (dict {namespace: prim_path}, list of containers)
         """
+        set_members = instance.data.get("setMembers", [])
+        member_namespaces = self._extract_namespaces(set_members)
 
+        containers = self._get_all_containers()
+        if not containers:
+            return {}, []
+
+        # Single container → use it regardless of namespace
+        if len(containers) == 1:
+            ns = next(iter(member_namespaces)) if member_namespaces else ""
+            return {ns: containers[0]["prim_path"]}, containers
+
+        # Multiple containers: match each member namespace
+        matched = {}
+        if member_namespaces:
+            for container in containers:
+                c_ns = container["namespace"]
+                c_name = container["name"]
+                for ns in member_namespaces:
+                    if ns in matched:
+                        continue  # already matched
+                    if (c_ns and c_ns == ns) or (c_name and c_name == ns):
+                        matched[ns] = container["prim_path"]
+                        self.log.debug(
+                            f"Matched namespace '{ns}' -> "
+                            f"{container['prim_path']}"
+                        )
+
+        # If no namespace matches found, fall back to first container
+        if not matched and containers:
+            ns = next(iter(member_namespaces)) if member_namespaces else ""
+            matched[ns] = containers[0]["prim_path"]
+            self.log.debug(
+                f"No namespace match, using first container: "
+                f"{containers[0]['prim_path']}"
+            )
+
+        return matched, containers
+
+    def _detect_asset_prim_path_fallback(self, instance):
+        """Fallback detection: manual input or UFE selection.
+
+        Used when container-based detection finds nothing.
+
+        Returns:
+            str: Detected prim path or empty string.
+        """
         creator_attrs = instance.data.get("creator_attributes", {})
 
-        # Strategy 1: Check manual input first (user override)
+        # Manual input (user override)
         manual_input = creator_attrs.get(
             "originalAssetPrimPath", ""
         ).strip()
@@ -94,26 +162,67 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
             self.log.debug(f"Using manual asset prim path: {manual_input}")
             return manual_input
 
-        # Strategy 2: Match containers by namespace of animated members
-        set_members = instance.data.get("setMembers", [])
-        asset_prim_path = self._detect_from_containers(set_members)
-        if asset_prim_path:
+        # UFE selection
+        prim_path = self._detect_from_ufe_selection()
+        if prim_path:
             self.log.info(
-                f"Auto-detected asset prim path from containers: "
-                f"{asset_prim_path}"
+                f"Auto-detected asset prim path from UFE: {prim_path}"
             )
-            return asset_prim_path
-
-        # Strategy 3: Try UFE selection
-        asset_prim_path = self._detect_from_ufe_selection()
-        if asset_prim_path:
-            self.log.info(
-                f"Auto-detected asset prim path from UFE selection: "
-                f"{asset_prim_path}"
-            )
-            return asset_prim_path
+            return prim_path
 
         return ""
+
+    # ------------------------------------------------------------------
+    # Container discovery
+    # ------------------------------------------------------------------
+
+    def _get_all_containers(self):
+        """Find all AYON containers in USD proxy shapes.
+
+        Returns:
+            list[dict]: Each dict has 'prim_path', 'namespace', 'name'.
+        """
+        try:
+            import mayaUsd
+        except ImportError:
+            self.log.debug(
+                "mayaUsd module not available, cannot detect containers"
+            )
+            return []
+
+        proxy_shapes = cmds.ls(type="mayaUsdProxyShape", long=True) or []
+        all_containers = []
+
+        for proxy_shape in proxy_shapes:
+            try:
+                stage = mayaUsd.ufe.getStage(proxy_shape)
+                if not stage:
+                    continue
+
+                for prim in stage.Traverse():
+                    container_id = prim.GetCustomDataByKey("ayon:id")
+                    if container_id == AVALON_CONTAINER_ID:
+                        all_containers.append({
+                            "prim_path": str(prim.GetPath()),
+                            "namespace": (
+                                prim.GetCustomDataByKey(
+                                    "ayon:namespace"
+                                ) or ""
+                            ),
+                            "name": (
+                                prim.GetCustomDataByKey("ayon:name") or ""
+                            ),
+                        })
+            except (RuntimeError, AttributeError) as e:
+                self.log.debug(
+                    f"Could not get stage from {proxy_shape}: {e}"
+                )
+                continue
+
+        self.log.debug(
+            f"Found {len(all_containers)} USD container(s) in scene"
+        )
+        return all_containers
 
     def _extract_namespaces(self, members):
         """Extract unique Maya namespaces from member node names.
@@ -140,110 +249,6 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
                 namespaces.add(ns)
         return namespaces
 
-    def _detect_from_containers(self, set_members):
-        """Detect asset prim path from USD containers in the scene.
-
-        Uses the proper mayaUsd Python API to get stages from proxy shapes,
-        then traverses all prims looking for ones with Ayon container
-        metadata (ayon:id custom data).
-
-        When multiple containers are found, matches against the
-        setMembers' Maya namespaces to find the correct asset.
-
-        Args:
-            set_members: List of Maya DAG node paths (animated members)
-
-        Returns:
-            str: Detected prim path or empty string
-        """
-        try:
-            import mayaUsd
-
-            # Extract namespaces from selected members for matching
-            member_namespaces = self._extract_namespaces(set_members)
-
-            # Find all mayaUsdProxyShape nodes
-            proxy_shapes = (
-                cmds.ls(type="mayaUsdProxyShape", long=True) or []
-            )
-
-            all_containers = []
-
-            for proxy_shape in proxy_shapes:
-                try:
-                    stage = mayaUsd.ufe.getStage(proxy_shape)
-                    if not stage:
-                        continue
-
-                    # Traverse all prims looking for containers
-                    for prim in stage.Traverse():
-                        container_id = prim.GetCustomDataByKey("ayon:id")
-                        if container_id == AVALON_CONTAINER_ID:
-                            prim_path = str(prim.GetPath())
-                            container_ns = (
-                                prim.GetCustomDataByKey("ayon:namespace") or ""
-                            )
-                            container_name = (
-                                prim.GetCustomDataByKey("ayon:name") or ""
-                            )
-                            all_containers.append({
-                                "prim_path": prim_path,
-                                "namespace": container_ns,
-                                "name": container_name,
-                            })
-                except (RuntimeError, AttributeError) as e:
-                    self.log.debug(
-                        f"Could not get stage from {proxy_shape}: {e}"
-                    )
-                    continue
-
-            if not all_containers:
-                self.log.debug("No USD containers found in scene")
-                return ""
-
-            # If only one container, use it directly
-            if len(all_containers) == 1:
-                prim_path = all_containers[0]["prim_path"]
-                self.log.debug(
-                    f"Single container found: {prim_path}"
-                )
-                return prim_path
-
-            # Multiple containers: try to match by namespace
-            if member_namespaces:
-                for container in all_containers:
-                    container_ns = container["namespace"]
-                    container_name = container["name"]
-                    # Check if any member namespace matches the container
-                    if container_ns and container_ns in member_namespaces:
-                        self.log.debug(
-                            f"Matched container by namespace "
-                            f"'{container_ns}': {container['prim_path']}"
-                        )
-                        return container["prim_path"]
-                    if container_name and container_name in member_namespaces:
-                        self.log.debug(
-                            f"Matched container by name "
-                            f"'{container_name}': {container['prim_path']}"
-                        )
-                        return container["prim_path"]
-
-            # Fallback: return the first container found
-            prim_path = all_containers[0]["prim_path"]
-            self.log.debug(
-                f"Multiple containers found, using first: {prim_path}"
-            )
-            return prim_path
-
-        except ImportError:
-            self.log.debug(
-                "mayaUsd module not available, cannot detect containers"
-            )
-        except Exception as e:
-            self.log.debug(f"Error detecting from containers: {e}")
-
-        return ""
-
     def _detect_from_ufe_selection(self):
         """Detect asset prim path from UFE USD prim selection.
 
@@ -264,12 +269,15 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
 
         return ""
 
-    def _detect_department(self, instance):
-        """Detect department from task context or use override.
+    # ------------------------------------------------------------------
+    # Department auto-detection
+    # ------------------------------------------------------------------
 
-        Checks the creator attribute first. When set to ``"auto"``,
-        resolves from the current task entity using both task name
-        and task type for maximum compatibility across studio naming
+    def _detect_department(self, instance):
+        """Auto-detect department from AYON task context.
+
+        Checks both task name and task type against known department
+        mappings for maximum compatibility across studio naming
         conventions.
 
         Returns:
@@ -283,7 +291,7 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
         if department != "auto":
             return department
 
-        # Try to auto-detect from task context
+        # Auto-detect from task context
         try:
             task_entity = instance.data.get("taskEntity")
             if not task_entity:
