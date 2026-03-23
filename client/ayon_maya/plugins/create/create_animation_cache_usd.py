@@ -32,58 +32,35 @@ from ayon_core.lib import (
     NumberDef,
     TextDef
 )
+from ayon_core.pipeline.constants import AVALON_CONTAINER_ID
 from maya import cmds
-
-
-def _detect_department_from_context(create_context):
-    """Detect department from the current AYON task context.
-
-    Checks both task name and task type against known department
-    mappings.  Returns the matching department string or ``"auto"``
-    if nothing matches.
-
-    Args:
-        create_context: The AYON create context.
-
-    Returns:
-        str: Detected department or "auto".
-    """
-    try:
-        task_entity = create_context.get_current_task_entity()
-        if not task_entity:
-            return "auto"
-
-        task_name = (task_entity.get("name") or "").lower()
-        task_type = (task_entity.get("taskType") or "").lower()
-
-        dept_mapping = {
-            "anim": "animation",
-            "animation": "animation",
-            "layout": "layout",
-            "cfx": "cfx",
-            "fx": "fx",
-        }
-
-        for source in (task_name, task_type):
-            for key, dept in dept_mapping.items():
-                if key in source:
-                    return dept
-
-    except Exception:
-        pass
-
-    return "auto"
 
 
 def _get_namespace_to_asset_name():
     """Map Maya namespaces to USD asset prim names.
 
-    The Maya namespace used by "Edit as Maya Data" comes from the
-    ``mayaNamespace`` attribute on the ``MayaReference`` prim.  When
-    editing is active, the prim may be invisible in the composed
-    stage (``stage.Traverse()`` skips it), so this function reads the
-    **individual Sdf layers** directly — which always contain the
-    authored opinions regardless of composition state.
+    Uses two strategies combined:
+
+    1. **Container-based** (primary): Traverse the composed stage for
+       AYON container prims (``ayon:id == AVALON_CONTAINER_ID``).
+       These parent Xform prims remain visible even when their child
+       MayaReference prims are "pulled" into Maya via "Edit as Maya
+       Data".  The prim *name* (last path component) is the asset
+       name (e.g. ``/cone_character`` → ``"cone_character"``).
+
+    2. **MayaReference child lookup** (via Sdf): For each container
+       prim, read its child prim specs through the Sdf layer API to
+       find MayaReference prims and their ``mayaNamespace`` attribute.
+       This gives the *exact* Maya namespace that "Edit as Maya Data"
+       created, even though the MayaReference prim is invisible in
+       the composed stage.
+
+    The resulting dict maps ``{maya_namespace: asset_prim_name}``.
+
+    When the Sdf lookup fails to find the ``mayaNamespace`` (e.g. no
+    MayaReference child, or the attribute is stored differently),
+    the function falls back to matching via ``ayon:namespace`` and
+    ``ayon:name`` metadata on the container.
 
     Returns:
         dict[str, str]: ``{maya_namespace: asset_prim_name}``.
@@ -103,16 +80,28 @@ def _get_namespace_to_asset_name():
             if not stage:
                 continue
 
-            # Read ALL layers used by the stage (sublayers,
-            # referenced files, etc.) via the Sdf API — this
-            # bypasses composition and sees MayaReference prims
-            # even when "Edit as Maya Data" is active.
-            for layer in stage.GetUsedLayers():
-                _search_layer_for_maya_refs(
-                    layer,
-                    Sdf.Path.absoluteRootPath,
-                    ns_to_name,
+            containers = _find_containers(stage)
+            for container in containers:
+                prim_path = container["prim_path"]
+                asset_name = container["asset_name"]
+
+                # Strategy 1: Find mayaNamespace from child
+                # MayaReference prim specs via Sdf layers.
+                maya_ns = _find_maya_namespace_for_container(
+                    stage, prim_path, Sdf
                 )
+                if maya_ns:
+                    ns_to_name[maya_ns] = asset_name
+                    continue
+
+                # Strategy 2: Fall back to container metadata.
+                # Use ayon:namespace or ayon:name as the key.
+                c_ns = container["namespace"]
+                c_name = container["name"]
+                if c_ns:
+                    ns_to_name[c_ns] = asset_name
+                if c_name and c_name != asset_name:
+                    ns_to_name[c_name] = asset_name
 
         except (RuntimeError, AttributeError):
             continue
@@ -120,32 +109,83 @@ def _get_namespace_to_asset_name():
     return ns_to_name
 
 
-def _search_layer_for_maya_refs(layer, parent_path, result):
-    """Recursively search an Sdf.Layer for MayaReference prim specs.
+def _find_containers(stage):
+    """Find all AYON container prims in the composed stage.
 
-    When a prim spec has ``typeName == "MayaReference"`` and a
-    ``mayaNamespace`` attribute, records the mapping
-    ``{mayaNamespace: parent_prim_name}`` in *result*.
+    Container prims are Xform prims with ``ayon:id`` custom data
+    matching ``AVALON_CONTAINER_ID``.  These remain visible via
+    ``stage.Traverse()`` even when child MayaReference prims are
+    "pulled" into Maya.
+
+    Returns:
+        list[dict]: Each dict has ``prim_path``, ``asset_name``,
+            ``namespace``, ``name``.
     """
-    spec = layer.GetPrimAtPath(parent_path)
-    if not spec:
-        return
+    containers = []
+    for prim in stage.Traverse():
+        container_id = prim.GetCustomDataByKey("ayon:id")
+        if container_id != AVALON_CONTAINER_ID:
+            continue
 
-    for child_spec in spec.nameChildren:
-        child_path = parent_path.AppendChild(child_spec.name)
+        prim_path = str(prim.GetPath())
+        # The prim name IS the asset name in the USD hierarchy.
+        # e.g. /cone_character → "cone_character"
+        asset_name = prim.GetName()
+        containers.append({
+            "prim_path": prim_path,
+            "asset_name": asset_name,
+            "namespace": prim.GetCustomDataByKey("ayon:namespace") or "",
+            "name": prim.GetCustomDataByKey("ayon:name") or "",
+        })
+    return containers
 
-        if child_spec.typeName == "MayaReference":
-            ns_attr = child_spec.attributes.get("mayaNamespace")
-            if ns_attr and ns_attr.default:
-                maya_ns = str(ns_attr.default)
-                # Asset name = parent prim name
-                # e.g. /cone_character/rig → "cone_character"
-                parent_name = parent_path.name
-                if parent_name:
-                    result[maya_ns] = parent_name
 
-        # Recurse into children
-        _search_layer_for_maya_refs(layer, child_path, result)
+def _find_maya_namespace_for_container(stage, container_prim_path, Sdf):
+    """Find the ``mayaNamespace`` attribute for a container's child.
+
+    Searches through all layers used by the stage for a child prim
+    spec under *container_prim_path* that has ``typeName ==
+    "MayaReference"`` and a ``mayaNamespace`` attribute.
+
+    This uses the Sdf (scene description) API which bypasses
+    composition and can see prim specs even when they are "pulled"
+    into Maya.
+
+    Args:
+        stage: The USD stage.
+        container_prim_path (str): Sdf path of the container prim.
+        Sdf: The ``pxr.Sdf`` module.
+
+    Returns:
+        str or None: The ``mayaNamespace`` value, or ``None``.
+    """
+    parent_path = Sdf.Path(container_prim_path)
+
+    for layer in stage.GetUsedLayers():
+        spec = layer.GetPrimAtPath(parent_path)
+        if not spec:
+            continue
+
+        for child_spec in spec.nameChildren:
+            if child_spec.typeName == "MayaReference":
+                ns_attr = child_spec.attributes.get("mayaNamespace")
+                if ns_attr and ns_attr.default:
+                    return str(ns_attr.default)
+
+            # Also check grandchildren (MayaReference might be
+            # nested one level deeper, e.g. under a variant).
+            child_path = parent_path.AppendChild(child_spec.name)
+            child_full = layer.GetPrimAtPath(child_path)
+            if child_full:
+                for grandchild in child_full.nameChildren:
+                    if grandchild.typeName == "MayaReference":
+                        ns_attr = grandchild.attributes.get(
+                            "mayaNamespace"
+                        )
+                        if ns_attr and ns_attr.default:
+                            return str(ns_attr.default)
+
+    return None
 
 
 def _group_members_by_namespace(members):
@@ -295,27 +335,6 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
                     "1.0 = every frame, 0.5 = two samples per frame"
                 )
             )
-        )
-
-        # Department / USD Contribution layer — auto-detected default
-        detected_dept = _detect_department_from_context(self.create_context)
-        defs.append(
-            EnumDef("department",
-                    label="USD Contribution Layer",
-                    items={
-                        "auto": "Auto-detect from task",
-                        "animation": "Animation",
-                        "layout": "Layout",
-                        "cfx": "CFX",
-                        "fx": "FX"
-                    },
-                    default=detected_dept,
-                    tooltip=(
-                        "Department layer for the USD contribution.\n"
-                        "Auto-detected from the current AYON task context "
-                        "so that animation exports to the animation layer, "
-                        "layout to layout, etc."
-                    ))
         )
 
         # Asset prim path (fallback if auto-detection fails)
