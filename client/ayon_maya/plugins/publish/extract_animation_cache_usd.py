@@ -10,12 +10,6 @@ Outputs:
    - No rig structure, no control curves
    - Ready to be composed as an override in the shot
 
-The workflow:
-1. Select the deformed geometry (typically from inside the rigged asset)
-2. Export with proper options (no skeleton, no skin, no rig)
-3. Post-process to remap hierarchy to match original asset prim path
-4. Result: Clean point cache with correct hierarchy for sublayer composition
-
 Multi-asset support:
 When the instance contains members from multiple assets (namespaces),
 the collector provides ``allAssetPrimPaths`` — a dict mapping each
@@ -23,10 +17,14 @@ namespace to its USD prim path in the shot stage.  The extractor
 remaps *all* matched assets into a single output layer so that the
 cache covers every selected character.
 
-Usage:
-- Select: /assets/character/cone_character/geo/cone_character_GEO (or similar)
-- Publish with animationCacheUsd family
-- Get: point_cache.usd with animated mesh at the correct prim path
+Hierarchy matching:
+The remapper uses a three-level strategy to find each asset subtree
+in the exported USD:
+1. **Name match** — prim name equals the asset name from the target path
+2. **Suffix match** — prim name ends with ``:asset_name`` (namespaced)
+3. **Geometry root** — finds the deepest common ancestor of all Mesh
+   prims in the layer (fallback when namespace stripping causes the
+   prim names to differ from the USD stage names)
 """
 
 import os
@@ -67,8 +65,6 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         cache_file = self._export_animation_cache(instance, staging_dir)
 
         # 2. Remap hierarchy to match original asset prim path(s)
-        #    and optionally apply !resetXformStack! to prevent
-        #    double-transforms from layout positioning.
         creator_attrs = instance.data.get("creator_attributes", {})
         apply_reset = creator_attrs.get("resetXformStack", True)
         self._remap_to_asset_hierarchy(
@@ -93,10 +89,6 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
     def _export_animation_cache(self, instance, staging_dir) -> str:
         """Export animated geometry as USD point cache.
 
-        This exports the deformed geometry (shape/mesh) with animated point
-        positions. No rig structure, no control curves - just the final
-        animated geometry.
-
         Args:
             instance: Publish instance
             staging_dir: Staging directory for output
@@ -105,24 +97,19 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             str: Path to exported USD file
         """
 
-        # Load Maya USD plugin
         cmds.loadPlugin("mayaUsdPlugin", quiet=True)
 
-        # Prepare output file
         filename = f"{instance.name}_cache.usd"
         filepath = os.path.join(staging_dir, filename).replace("\\", "/")
 
-        # Get animation settings
         creator_attrs = instance.data.get("creator_attributes", {})
         sampling_mode = instance.data.get("samplingMode", "sparse")
         custom_step = instance.data.get("customStepSize", 1.0)
 
-        # Determine frame step
         frame_step = 1.0
         if sampling_mode == "custom":
             frame_step = custom_step
 
-        # Get members to export (should be shape/mesh nodes)
         members = instance.data.get("setMembers", [])
         if not members:
             raise PublishValidationError(
@@ -137,13 +124,6 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         )
         self.log.debug(f"Sampling: {sampling_mode} (step: {frame_step})")
 
-        # Prepare export options for POINT CACHE
-        # Note: exportBlendShapes is False because for a point cache we
-        # export the final deformed point positions (which already include
-        # blendshape deformation).  Enabling it would try to export the
-        # blendshape deformer *structure* as USD schema, which frequently
-        # fails on complex rigs (especially combined with stripNamespaces
-        # or selection-only exports) and is unnecessary for point caches.
         options = {
             "file": filepath,
             "selection": True,
@@ -167,7 +147,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             "eulerFilter": True,
         }
 
-        # Try to use worldspace if available (Maya USD 0.21.0+)
+        # Try worldspace if available (Maya USD 0.21.0+)
         has_worldspace = False
         try:
             maya_usd_version = parse_version(
@@ -176,30 +156,20 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             if maya_usd_version >= (0, 21, 0):
                 options["worldspace"] = True
                 has_worldspace = True
-            else:
-                self.log.debug(
-                    f"Maya USD {maya_usd_version} < 0.21.0, no worldspace"
-                )
         except Exception as e:
             self.log.debug(f"Could not determine Maya USD version: {e}")
 
         self.log.debug(f"Export options: {options}")
 
-        # Build fallback strategies: progressively disable options that
-        # are known to cause failures on complex rigs / scenes.
-        fallbacks = [{}]  # first attempt: use options as-is
+        fallbacks = [{}]
         if has_worldspace:
-            # worldspace can conflict with certain deformer stacks
             fallbacks.append({"worldspace": False})
 
-        # Export USD with animation (with fallback chain)
         with maintained_selection():
             cmds.select(members, replace=True, noExpand=True)
             last_error = None
             for i, overrides in enumerate(fallbacks):
                 attempt_opts = dict(options, **overrides)
-                # Remove keys set to False that are flag-type
-                # (worldspace=False means "don't pass it at all")
                 if overrides.get("worldspace") is False:
                     attempt_opts.pop("worldspace", None)
                 try:
@@ -208,15 +178,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                             f"Retrying export (attempt {i + 1}) "
                             f"with overrides: {overrides}"
                         )
-                        self.log.debug(
-                            f"Fallback export options: {attempt_opts}"
-                        )
                     cmds.mayaUSDExport(**attempt_opts)
-                    if i > 0:
-                        self.log.warning(
-                            "Export succeeded with fallback options. "
-                            "Disabled: %s", list(overrides.keys())
-                        )
                     last_error = None
                     break
                 except RuntimeError as e:
@@ -249,27 +211,21 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                                   reset_xform_stack=False):
         """Remap exported USD hierarchy to match original asset prim paths.
 
-        Supports **multiple assets** in a single export.  The collector
-        provides ``allAssetPrimPaths`` (a dict mapping namespace →
-        prim path) when the instance's members span several loaded
-        assets.  Each matched asset subtree is copied to its correct
-        target path in the output layer.
+        Supports **multiple assets** in a single export.  Uses a
+        three-level matching strategy:
 
-        When only a single ``originalAssetPrimPath`` is available, the
-        method falls back to single-asset behaviour.
-
-        All operations happen on an in-memory ``Sdf.Layer`` before a
-        single ``Export()`` to disk, which avoids layer-cache / mmap
-        corruption issues with binary ``.usdc`` files on Windows.
+        1. **Name match** — exact prim name match
+        2. **Suffix match** — namespace-prefixed name (``ns:name``)
+        3. **Geometry root** — deepest common ancestor of all Mesh
+           prims (fallback when ``stripNamespaces`` causes names to
+           diverge from the USD stage prim names)
 
         Args:
             filepath: Path to the exported USD file.
             instance: Publish instance.
-            reset_xform_stack: If True, add ``!resetXformStack!`` to the
-                asset root prims and their geometry children.
+            reset_xform_stack: If True, add ``!resetXformStack!``.
         """
 
-        # Gather target prim paths — prefer the multi-asset dict
         all_paths = instance.data.get("allAssetPrimPaths", {})
         if not all_paths:
             single = instance.data.get("originalAssetPrimPath", "")
@@ -279,9 +235,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         if not all_paths:
             self.log.warning(
                 "No originalAssetPrimPath available. "
-                "Cannot remap LayCache hierarchy. The exported USD will "
-                "keep the Maya scene hierarchy which may not compose "
-                "correctly as a sublayer."
+                "Cannot remap hierarchy."
             )
             return
 
@@ -290,64 +244,78 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             self.log.error(f"Could not open exported USD: {filepath}")
             return
 
-        # ---- Check if ALL target paths already exist in the exported
-        #      layer (no remapping needed) ----
-        all_already_correct = True
-        for target_str in all_paths.values():
-            target_path = Sdf.Path(target_str)
-            asset_name = target_path.name
-            source = (
-                self._find_prim_by_name(layer, asset_name)
-                or self._find_prim_by_name_suffix(layer, asset_name)
-            )
-            if source != target_path:
-                all_already_correct = False
-                break
+        # Log the exported layer structure for debugging
+        self._log_layer_structure(layer)
 
-        if all_already_correct and len(all_paths) == 1:
-            target_path = Sdf.Path(next(iter(all_paths.values())))
-            self.log.debug(
-                "Hierarchy already correct, no remapping needed"
-            )
-            self._cleanup_non_geometry(layer, target_path)
-            self._strip_material_bindings(layer, target_path)
-            self._convert_to_over_specifiers(layer, target_path)
-            if reset_xform_stack:
-                self._apply_reset_xform_stack_sdf(layer, target_path)
-            layer.Save()
-            return
-
-        # ---- Build a new layer with all assets remapped ----
+        # Build new layer with correct hierarchy
         new_layer = Sdf.Layer.CreateAnonymous()
         self._copy_layer_metadata(layer, new_layer)
 
         first_root_name = None
         remapped_count = 0
+        num_targets = len(all_paths)
 
         for ns, target_str in all_paths.items():
             target_path = Sdf.Path(target_str)
             asset_name = target_path.name
 
-            # Find the asset prim in the exported hierarchy
+            # Strategy 1: exact name match
             source_path = self._find_prim_by_name(layer, asset_name)
+
+            # Strategy 2: namespace-suffixed match
             if not source_path:
                 source_path = self._find_prim_by_name_suffix(
                     layer, asset_name
                 )
 
+            # Strategy 3: geometry root fallback — when there is
+            # exactly one target, use the geometry root of the whole
+            # exported layer regardless of its prim name.
+            if not source_path and num_targets == 1:
+                source_path = self._find_geometry_root(layer)
+                if source_path:
+                    self.log.info(
+                        f"Name match failed for '{asset_name}'. "
+                        f"Using geometry root: {source_path}"
+                    )
+
             if not source_path:
                 self.log.warning(
-                    f"Could not find prim '{asset_name}' (namespace "
-                    f"'{ns}') in exported USD. Skipping this asset."
+                    f"Could not find prim for asset '{asset_name}' "
+                    f"(namespace '{ns}') in exported USD. "
+                    f"Skipping this asset."
                 )
                 continue
 
+            # Check if already at correct path
+            if source_path == target_path:
+                self.log.debug(
+                    f"Asset '{asset_name}' already at correct path"
+                )
+                # Sanitise in-place on the source layer
+                self._cleanup_non_geometry(layer, target_path)
+                self._strip_material_bindings(layer, target_path)
+                self._convert_to_over_specifiers(layer, target_path)
+                if reset_xform_stack:
+                    self._apply_reset_xform_stack_sdf(layer, target_path)
+                # Copy from sanitised source into new layer
+                prefixes = target_path.GetPrefixes()
+                for prefix in prefixes[:-1]:
+                    if not new_layer.GetPrimAtPath(prefix):
+                        ps = Sdf.CreatePrimInLayer(new_layer, prefix)
+                        ps.specifier = Sdf.SpecifierOver
+                        ps.typeName = "Xform"
+                Sdf.CopySpec(layer, target_path, new_layer, target_path)
+                if first_root_name is None:
+                    first_root_name = prefixes[0].name
+                remapped_count += 1
+                continue
+
             self.log.info(
-                f"Remapping asset '{asset_name}': "
-                f"{source_path} -> {target_path}"
+                f"Remapping '{asset_name}': {source_path} -> {target_path}"
             )
 
-            # Create parent Xform prims (with 'over' specifier).
+            # Create parent Xform prims with 'over' specifier
             prefixes = target_path.GetPrefixes()
             for prefix in prefixes[:-1]:
                 if not new_layer.GetPrimAtPath(prefix):
@@ -355,13 +323,12 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                     prim_spec.specifier = Sdf.SpecifierOver
                     prim_spec.typeName = "Xform"
 
-            # Copy the asset subtree from source to target
+            # Copy the asset subtree
             if not Sdf.CopySpec(
                 layer, source_path, new_layer, target_path
             ):
                 self.log.error(
-                    f"Failed to copy prim specs: "
-                    f"{source_path} -> {target_path}"
+                    f"Failed to copy: {source_path} -> {target_path}"
                 )
                 continue
 
@@ -383,96 +350,20 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             )
             return
 
-        # Set defaultPrim to the topmost prim
         if first_root_name:
             new_layer.defaultPrim = first_root_name
 
         new_layer.Export(filepath)
         self.log.info(
-            f"Hierarchy remapped successfully for "
-            f"{remapped_count} asset(s)"
+            f"Hierarchy remapped for {remapped_count} asset(s)"
         )
 
-    def _apply_reset_xform_stack_sdf(self, layer, root_path):
-        """Add ``!resetXformStack!`` via the Sdf (scene-description) API.
-
-        Directly manipulates the ``xformOpOrder`` attribute on PrimSpecs
-        in the given layer.  This avoids having to open a ``Usd.Stage``
-        (and the layer-cache / mmap problems that come with it on
-        Windows when the file was just rewritten by ``Export()``).
-
-        The reset token is prepended to the existing ``xformOpOrder``
-        list.  If no ``xformOpOrder`` exists yet, one is created with
-        just the reset token.
-
-        Applied to:
-        - The prim at *root_path* itself (the asset root)
-        - All direct children whose typeName is Mesh, Xform, or Scope
-        """
-        RESET_TOKEN = "!resetXformStack!"
-        xformable_types = {"Xform", "Scope", "Mesh"}
-
-        def _set_reset(prim_spec):
-            """Prepend !resetXformStack! to xformOpOrder on a PrimSpec."""
-            if prim_spec is None:
-                return False
-
-            attr = prim_spec.attributes.get("xformOpOrder")
-            if attr is not None:
-                current = list(attr.default)
-                if RESET_TOKEN in current:
-                    return False  # already present
-                attr.default = [RESET_TOKEN] + current
-            else:
-                # Create the attribute with just the reset token
-                attr = Sdf.AttributeSpec(
-                    prim_spec,
-                    "xformOpOrder",
-                    Sdf.ValueTypeNames.TokenArray
-                )
-                attr.default = [RESET_TOKEN]
-
-            self.log.debug(
-                f"Added resetXformStack to: {prim_spec.path}"
-            )
-            return True
-
-        modified = False
-
-        # Apply to the root prim
-        root_spec = layer.GetPrimAtPath(root_path)
-        if root_spec and root_spec.typeName in xformable_types:
-            modified |= _set_reset(root_spec)
-
-        # Apply to direct children
-        if root_spec:
-            for child_spec in root_spec.nameChildren:
-                if child_spec.typeName in xformable_types:
-                    modified |= _set_reset(child_spec)
-
-        if modified:
-            self.log.info(
-                "Applied !resetXformStack! to prevent double-transforms"
-            )
-
-    def _copy_layer_metadata(self, source_layer, target_layer):
-        """Copy layer-level metadata (timeCode, upAxis, etc.)."""
-        source_root = source_layer.pseudoRoot
-        target_root = target_layer.pseudoRoot
-
-        skip_keys = {
-            "primChildren", "defaultPrim",
-            "subLayers", "subLayerOffsets",
-        }
-        for key in source_root.ListInfoKeys():
-            if key not in skip_keys:
-                try:
-                    target_root.SetInfo(key, source_root.GetInfo(key))
-                except Exception:
-                    pass
+    # ------------------------------------------------------------------
+    # Prim finding strategies
+    # ------------------------------------------------------------------
 
     def _find_prim_by_name(self, layer, name):
-        """Find first prim with exact name match via depth-first search."""
+        """Find first prim with exact name match (depth-first)."""
 
         def _search(parent_path):
             spec = layer.GetPrimAtPath(parent_path)
@@ -497,11 +388,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         return None
 
     def _find_prim_by_name_suffix(self, layer, name):
-        """Find prim whose name ends with ':name' (namespace handling).
-
-        When stripNamespaces is False, prim names may include namespaces
-        like 'myNs:cone_character'. This matches those cases.
-        """
+        """Find prim whose name ends with ':name' (namespace handling)."""
         suffix = f":{name}"
 
         def _search(parent_path):
@@ -526,23 +413,167 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                 return result
         return None
 
+    def _find_geometry_root(self, layer):
+        """Find the geometry root: deepest common ancestor of all Meshes.
+
+        When ``stripNamespaces`` removes the namespace prefix from prim
+        names, the asset name no longer appears in the exported
+        hierarchy.  This fallback finds all Mesh prims, computes their
+        deepest common ancestor, and returns it as the "asset root"
+        to remap.
+
+        Returns:
+            Sdf.Path or None: The geometry root path.
+        """
+        mesh_paths = []
+
+        def _collect(path):
+            spec = layer.GetPrimAtPath(path)
+            if not spec:
+                return
+            if spec.typeName == "Mesh":
+                mesh_paths.append(path)
+            for child in spec.nameChildren:
+                _collect(path.AppendChild(child.name))
+
+        for root_spec in layer.rootPrims:
+            _collect(
+                Sdf.Path.absoluteRootPath.AppendChild(root_spec.name)
+            )
+
+        if not mesh_paths:
+            self.log.debug("No Mesh prims found in exported USD")
+            return None
+
+        # Find deepest common ancestor
+        prefix_lists = [p.GetPrefixes() for p in mesh_paths]
+        min_depth = min(len(pl) for pl in prefix_lists)
+
+        common = Sdf.Path.absoluteRootPath
+        for i in range(min_depth):
+            candidate = prefix_lists[0][i]
+            if all(pl[i] == candidate for pl in prefix_lists):
+                common = candidate
+            else:
+                break
+
+        if common == Sdf.Path.absoluteRootPath:
+            # No common ancestor beyond root — use the first root prim
+            first_root = list(layer.rootPrims)
+            if first_root:
+                common = Sdf.Path.absoluteRootPath.AppendChild(
+                    first_root[0].name
+                )
+
+        self.log.debug(
+            f"Geometry root: {common} "
+            f"(from {len(mesh_paths)} mesh prim(s))"
+        )
+        return common
+
+    def _log_layer_structure(self, layer, max_depth=4):
+        """Log the prim structure of a layer for debugging."""
+        lines = []
+
+        def _walk(path, depth=0):
+            if depth >= max_depth:
+                return
+            spec = layer.GetPrimAtPath(path)
+            if not spec:
+                return
+            indent = "  " * depth
+            lines.append(
+                f"{indent}{spec.name} ({spec.typeName or 'untyped'})"
+            )
+            for child in spec.nameChildren:
+                _walk(path.AppendChild(child.name), depth + 1)
+
+        for root_spec in layer.rootPrims:
+            root_path = Sdf.Path.absoluteRootPath.AppendChild(
+                root_spec.name
+            )
+            _walk(root_path)
+
+        if lines:
+            structure = "\n".join(lines)
+            self.log.debug(
+                f"Exported USD structure:\n{structure}"
+            )
+
+    # ------------------------------------------------------------------
+    # resetXformStack
+    # ------------------------------------------------------------------
+
+    def _apply_reset_xform_stack_sdf(self, layer, root_path):
+        """Add ``!resetXformStack!`` via the Sdf API."""
+        RESET_TOKEN = "!resetXformStack!"
+        xformable_types = {"Xform", "Scope", "Mesh"}
+
+        def _set_reset(prim_spec):
+            if prim_spec is None:
+                return False
+
+            attr = prim_spec.attributes.get("xformOpOrder")
+            if attr is not None:
+                current = list(attr.default)
+                if RESET_TOKEN in current:
+                    return False
+                attr.default = [RESET_TOKEN] + current
+            else:
+                attr = Sdf.AttributeSpec(
+                    prim_spec,
+                    "xformOpOrder",
+                    Sdf.ValueTypeNames.TokenArray
+                )
+                attr.default = [RESET_TOKEN]
+
+            self.log.debug(
+                f"Added resetXformStack to: {prim_spec.path}"
+            )
+            return True
+
+        modified = False
+
+        root_spec = layer.GetPrimAtPath(root_path)
+        if root_spec and root_spec.typeName in xformable_types:
+            modified |= _set_reset(root_spec)
+
+        if root_spec:
+            for child_spec in root_spec.nameChildren:
+                if child_spec.typeName in xformable_types:
+                    modified |= _set_reset(child_spec)
+
+        if modified:
+            self.log.info(
+                "Applied !resetXformStack! to prevent double-transforms"
+            )
+
+    # ------------------------------------------------------------------
+    # Layer metadata
+    # ------------------------------------------------------------------
+
+    def _copy_layer_metadata(self, source_layer, target_layer):
+        """Copy layer-level metadata (timeCode, upAxis, etc.)."""
+        source_root = source_layer.pseudoRoot
+        target_root = target_layer.pseudoRoot
+
+        skip_keys = {
+            "primChildren", "defaultPrim",
+            "subLayers", "subLayerOffsets",
+        }
+        for key in source_root.ListInfoKeys():
+            if key not in skip_keys:
+                try:
+                    target_root.SetInfo(key, source_root.GetInfo(key))
+                except Exception:
+                    pass
+
     # ------------------------------------------------------------------
     # Override-layer sanitisation
     # ------------------------------------------------------------------
 
     def _strip_material_bindings(self, layer, root_path):
-        """Remove all material-related opinions from the cache layer.
-
-        The Maya USD exporter authors ``material:binding`` relationships,
-        ``MaterialBindingAPI`` in ``apiSchemas``, and ``subsetFamily:*``
-        attributes on Mesh prims.  After GeomSubset and Material prims
-        are removed by ``_cleanup_non_geometry``, these become broken
-        opinions that — because sublayer > reference in LIVRPS —
-        override the *valid* bindings from the original asset.
-
-        Stripping them lets the original asset's material assignments
-        pass through the composition unmodified.
-        """
+        """Remove all material-related opinions from the cache layer."""
         stripped = 0
 
         def _strip(path):
@@ -551,7 +582,6 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             if not spec:
                 return
 
-            # 1. Remove material:binding* relationships
             rels_to_remove = [
                 rel.name for rel in spec.relationships
                 if rel.name.startswith("material:binding")
@@ -560,8 +590,6 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                 spec.RemoveProperty(spec.relationships[name])
                 stripped += 1
 
-            # 2. Remove subsetFamily:* attributes (orphaned after
-            #    GeomSubset removal, e.g. subsetFamily:materialBind:*)
             attrs_to_remove = [
                 attr.name for attr in spec.attributes
                 if attr.name.startswith("subsetFamily:")
@@ -570,7 +598,6 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                 spec.RemoveProperty(spec.attributes[name])
                 stripped += 1
 
-            # 3. Remove MaterialBindingAPI from apiSchemas
             api_attr = spec.GetInfo("apiSchemas")
             if api_attr:
                 cleaned = [
@@ -597,16 +624,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             )
 
     def _convert_to_over_specifiers(self, layer, root_path):
-        """Change ``def`` specifiers to ``over`` on all prims.
-
-        A point-cache sublayer is an *override* layer: it only needs to
-        author the properties that differ from the original asset (e.g.
-        animated ``points``).  Using ``over`` instead of ``def`` means
-        that any property **not** authored here (materials, display
-        color, visibility, etc.) transparently passes through from the
-        weaker reference layer that holds the original asset.
-        """
-        # Convert the parent hierarchy prims (above the asset root)
+        """Change ``def`` specifiers to ``over`` on all prims."""
         for prefix in root_path.GetPrefixes():
             spec = layer.GetPrimAtPath(prefix)
             if spec and spec.specifier == Sdf.SpecifierDef:
@@ -622,30 +640,18 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                 _convert(path.AppendChild(child_spec.name))
 
         _convert(root_path)
-        self.log.debug("Converted all prim specifiers to 'over'")
 
     # ------------------------------------------------------------------
     # Non-geometry cleanup
     # ------------------------------------------------------------------
 
     def _cleanup_non_geometry(self, layer, root_path):
-        """Remove non-geometry prims from the pointcache.
-
-        For a pointcache sublayer we only need Mesh geometry and its
-        parent hierarchy (Xform, Scope). This removes:
-        - BasisCurves (rig control shapes)
-        - Material / Shader / NodeGraph prims
-        - MayaReference prims
-        - GeomSubset prims (face-material assignments come from the
-          original asset; the cache copies carry namespace-mangled names)
-        - Empty Xform/Scope containers with no geometry descendants
-        """
+        """Remove non-geometry prims from the pointcache."""
         non_geo_types = {
             "BasisCurves", "Material", "Shader",
             "NodeGraph", "MayaReference", "GeomSubset",
         }
 
-        # Pass 1: collect non-geometry typed prims
         prims_to_remove = []
 
         def _collect_non_geo(path):
@@ -654,7 +660,7 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                 return
             if spec.typeName in non_geo_types:
                 prims_to_remove.append(path)
-                return  # skip children - they'll be removed with parent
+                return
             for child_spec in list(spec.nameChildren):
                 _collect_non_geo(path.AppendChild(child_spec.name))
 
@@ -669,7 +675,6 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                 f"Removed {len(prims_to_remove)} non-geometry prims"
             )
 
-        # Pass 2: remove empty Xform/Scope containers
         self._remove_empty_containers(layer, root_path)
 
     def _remove_empty_containers(self, layer, root_path):

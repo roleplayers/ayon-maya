@@ -16,9 +16,8 @@ When "Split per Asset" is enabled and multiple assets are selected, the
 creator automatically groups members by their Maya namespace (each
 loaded USD asset gets its own namespace) and creates one publish
 instance per asset.  Each instance is named with the asset identifier
-so that individual cache layers can be updated independently — useful
-when CFX/FX need to iterate on specific characters in a multi-character
-shot.
+(from the USD container, not the Maya namespace) so that individual
+cache layers can be updated independently.
 
 When "Split per Asset" is disabled, all selected geometry is exported
 into a single cache.  The extractor and collector handle multiple
@@ -36,11 +35,89 @@ from ayon_core.lib import (
 from maya import cmds
 
 
+def _detect_department_from_context(create_context):
+    """Detect department from the current AYON task context.
+
+    Checks both task name and task type against known department
+    mappings.  Returns the matching department string or ``"auto"``
+    if nothing matches.
+
+    Args:
+        create_context: The AYON create context.
+
+    Returns:
+        str: Detected department or "auto".
+    """
+    try:
+        task_entity = create_context.get_current_task_entity()
+        if not task_entity:
+            return "auto"
+
+        task_name = (task_entity.get("name") or "").lower()
+        task_type = (task_entity.get("taskType") or "").lower()
+
+        dept_mapping = {
+            "anim": "animation",
+            "animation": "animation",
+            "layout": "layout",
+            "cfx": "cfx",
+            "fx": "fx",
+        }
+
+        for source in (task_name, task_type):
+            for key, dept in dept_mapping.items():
+                if key in source:
+                    return dept
+
+    except Exception:
+        pass
+
+    return "auto"
+
+
+def _get_namespace_to_asset_name():
+    """Map Maya namespaces to USD asset prim names from containers.
+
+    Queries all ``mayaUsdProxyShape`` nodes, traverses their stages,
+    and collects AYON container metadata.  Returns a dict mapping
+    the container's ``ayon:namespace`` to the **prim name** (last
+    path component) of the container prim — which is the asset name
+    as it appears in the USD stage hierarchy.
+
+    Returns:
+        dict[str, str]: ``{maya_namespace: asset_prim_name}``.
+    """
+    try:
+        import mayaUsd
+        from ayon_core.pipeline.constants import AVALON_CONTAINER_ID
+    except ImportError:
+        return {}
+
+    ns_to_name = {}
+    proxy_shapes = cmds.ls(type="mayaUsdProxyShape", long=True) or []
+
+    for proxy in proxy_shapes:
+        try:
+            stage = mayaUsd.ufe.getStage(proxy)
+            if not stage:
+                continue
+            for prim in stage.Traverse():
+                if prim.GetCustomDataByKey("ayon:id") == AVALON_CONTAINER_ID:
+                    ns = prim.GetCustomDataByKey("ayon:namespace") or ""
+                    prim_name = prim.GetPath().name  # e.g. "cone_character"
+                    if ns:
+                        ns_to_name[ns] = prim_name
+        except (RuntimeError, AttributeError):
+            continue
+
+    return ns_to_name
+
+
 def _group_members_by_namespace(members):
     """Group Maya DAG nodes by their root namespace.
 
     When an asset is loaded via "Edit as Maya Data" each asset lives
-    under its own Maya namespace (e.g. ``cone_character:pCube1``).
+    under its own Maya namespace (e.g. ``cone_character_01:pCube1``).
     This function groups members so that each group corresponds to
     one asset.
 
@@ -80,32 +157,29 @@ def _expand_to_geometry(members):
     Returns:
         list[str]: Expanded list including descendant mesh transforms.
     """
-    # Check if any selected node is already a mesh (or mesh transform)
+    # Check if any selected node already has mesh shapes
     has_mesh = False
     for member in members:
+        if cmds.nodeType(member) == "mesh":
+            has_mesh = True
+            break
         shapes = cmds.listRelatives(
             member, shapes=True, type="mesh", fullPath=True
         ) or []
         if shapes:
             has_mesh = True
             break
-        # Check if member itself is a mesh shape
-        if cmds.nodeType(member) == "mesh":
-            has_mesh = True
-            break
 
     if has_mesh:
-        # Selection already contains meshes, use as-is
         return members
 
-    # Selection has no meshes — expand: find all mesh descendants
+    # No meshes in selection — find all descendant meshes
     expanded = set()
     for member in members:
         meshes = cmds.listRelatives(
             member, allDescendents=True, type="mesh", fullPath=True
         ) or []
         if meshes:
-            # Get parent transforms of mesh shapes
             transforms = cmds.listRelatives(
                 meshes, parent=True, fullPath=True
             ) or []
@@ -114,7 +188,7 @@ def _expand_to_geometry(members):
     if expanded:
         return list(expanded)
 
-    # Nothing found — return original (let validator handle the error)
+    # Nothing found — return original
     return members
 
 
@@ -155,7 +229,6 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
     def get_attr_defs_for_instance(self, instance):
         """Get attribute definitions for this instance."""
 
-        # Get animation frame range defaults
         defs = lib.collect_animation_defs(
             create_context=self.create_context)
 
@@ -176,20 +249,41 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
                     ))
         )
 
-        # Custom step size (visible when custom selected)
-        custom_step_def = NumberDef(
-            "customStepSize",
-            label="Custom Step Size",
-            default=1.0,
-            decimals=3,
-            tooltip=(
-                "Step size for animation sampling.\n"
-                "1.0 = every frame, 0.5 = two samples per frame"
+        defs.append(
+            NumberDef(
+                "customStepSize",
+                label="Custom Step Size",
+                default=1.0,
+                decimals=3,
+                tooltip=(
+                    "Step size for animation sampling.\n"
+                    "1.0 = every frame, 0.5 = two samples per frame"
+                )
             )
         )
-        defs.append(custom_step_def)
 
-        # Asset prim path input (fallback if auto-detection fails)
+        # Department / USD Contribution layer — auto-detected default
+        detected_dept = _detect_department_from_context(self.create_context)
+        defs.append(
+            EnumDef("department",
+                    label="USD Contribution Layer",
+                    items={
+                        "auto": "Auto-detect from task",
+                        "animation": "Animation",
+                        "layout": "Layout",
+                        "cfx": "CFX",
+                        "fx": "FX"
+                    },
+                    default=detected_dept,
+                    tooltip=(
+                        "Department layer for the USD contribution.\n"
+                        "Auto-detected from the current AYON task context "
+                        "so that animation exports to the animation layer, "
+                        "layout to layout, etc."
+                    ))
+        )
+
+        # Asset prim path (fallback if auto-detection fails)
         defs.append(
             TextDef("originalAssetPrimPath",
                     label="Original Asset Prim Path",
@@ -198,17 +292,13 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
                     tooltip=(
                         "Full USD prim path of the original asset in the "
                         "shot stage.\n\n"
-                        "AUTO-DETECTED: This is normally resolved "
-                        "automatically from loaded USD containers (the prims "
-                        "with Ayon metadata). You do NOT need to fill this "
-                        "manually unless auto-detection fails.\n\n"
-                        "If auto-detection fails, enter the full prim path "
-                        "as it appears in the USD stage outliner.\n"
+                        "AUTO-DETECTED: Normally resolved automatically "
+                        "from loaded USD containers. You do NOT need to "
+                        "fill this manually unless auto-detection fails.\n\n"
                         "Example: /assets/character/cone_character"
                     ))
         )
 
-        # USD format
         defs.append(
             EnumDef("defaultUSDFormat",
                     label="File Format",
@@ -220,23 +310,18 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
                     tooltip="Output USD file format")
         )
 
-        # Reset Xform Stack (prevent double-transforms from layout)
         defs.append(
             BoolDef("resetXformStack",
                     label="Reset Xform Stack",
                     default=True,
                     tooltip=(
                         "Add !resetXformStack! to the exported cache prims.\n"
-                        "This prevents double-transforms when the cache is "
-                        "composed as a sublayer under an Xform that still "
-                        "carries the layout transform.\n\n"
-                        "When enabled (and worldspace export is used), the "
-                        "cache points are already in worldspace and ancestor "
-                        "transforms will be ignored during composition."
+                        "Prevents double-transforms when the cache is "
+                        "composed under an Xform that still carries the "
+                        "layout transform."
                     ))
         )
 
-        # Strip namespaces
         defs.append(
             BoolDef("stripNamespaces",
                     label="Strip Namespaces",
@@ -253,7 +338,8 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         members from more than one Maya namespace, one instance is
         created per namespace (i.e. per loaded asset).  Each instance
         receives the subset of members that belong to that asset, and
-        its product name is suffixed with the asset identifier.
+        its product name uses the **asset name** (from the USD
+        container metadata), not the Maya namespace.
 
         Selected parent transforms are automatically expanded to their
         descendant mesh geometry so the user can select rig roots or
@@ -280,7 +366,6 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         split_per_asset = pre_create_data.get("splitPerAsset", True)
 
         if not split_per_asset:
-            # Single instance with all members — select them and delegate
             cmds.select(members, replace=True, noExpand=True)
             return super().create(
                 product_name, instance_data, pre_create_data
@@ -289,14 +374,17 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         # --- Multi-asset split ---
         groups = _group_members_by_namespace(members)
 
-        # If there's only one group, no split needed
+        # Single group → no split needed
         if len(groups) <= 1:
             cmds.select(members, replace=True, noExpand=True)
             return super().create(
                 product_name, instance_data, pre_create_data
             )
 
-        # Multiple groups: create one instance per asset
+        # Query container metadata to get proper asset names
+        ns_to_asset = _get_namespace_to_asset_name()
+        self.log.debug(f"Namespace → asset name map: {ns_to_asset}")
+
         self.log.info(
             f"Splitting selection into {len(groups)} asset instances: "
             f"{list(groups.keys())}"
@@ -308,19 +396,24 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
 
         instances = []
         for namespace, ns_members in sorted(groups.items()):
-            # Derive a clean asset label from the namespace
-            asset_label = namespace if namespace else "default"
-            asset_variant = asset_label.replace(":", "_").replace(" ", "_")
+            # Use asset name from container, not the Maya namespace
+            asset_name = ns_to_asset.get(namespace, namespace)
+            if not asset_name:
+                asset_name = namespace or "default"
 
-            # Build variant: original variant + asset name
-            # e.g. "Main" + "cone_character" → "MainConeCharacter"
+            # Clean the name for use in variant
+            # "cone_character" → "ConeCharacter"
+            clean_name = asset_name.replace(":", "_").replace(" ", "_")
+            variant_suffix = "".join(
+                part.capitalize() for part in clean_name.split("_") if part
+            )
+
             base_variant = instance_data.get(
                 "variant",
                 self.get_default_variant()
             )
-            variant = base_variant + asset_variant.title().replace("_", "")
+            variant = base_variant + variant_suffix
 
-            # Generate proper product name via AYON's naming system
             asset_product_name = self.get_product_name(
                 project_name,
                 folder_entity,
@@ -328,16 +421,16 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
                 variant,
             )
 
-            # Build per-instance data
             asset_instance_data = dict(instance_data)
             asset_instance_data["variant"] = variant
 
             self.log.info(
-                f"Creating instance '{asset_product_name}' with "
-                f"{len(ns_members)} members from namespace '{namespace}'"
+                f"Creating '{asset_product_name}' — "
+                f"namespace='{namespace}', asset='{asset_name}', "
+                f"{len(ns_members)} members"
             )
 
-            # Select only this group's members and create
+            # Select ONLY this group's members
             cmds.select(ns_members, replace=True, noExpand=True)
 
             inst = super().create(
@@ -348,6 +441,4 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         # Restore original selection
         cmds.select(members, replace=True, noExpand=True)
 
-        # Return the last created instance (all are registered via
-        # _add_instance_to_context inside super().create())
         return instances[-1] if instances else None
