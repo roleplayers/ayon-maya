@@ -35,25 +35,16 @@ from ayon_core.lib import (
 from maya import cmds
 
 
-# Custom data key set by Maya USD when a prim is "pulled" into Maya
-# via "Edit as Maya Data".  The value is the Maya DAG path of the
-# pulled node (e.g. ``"|rigMain:rig"``).
-_PULL_DG_KEY = "Maya:Pull:DagPath"
-
-
 def _get_namespace_to_asset_name():
     """Map Maya namespaces to USD asset prim names.
 
     When "Edit as Maya Data" is active on a MayaReference prim,
-    Maya USD stores a ``Maya:Pull:DagPath`` custom-data key on that
-    prim with the Maya DAG path of the pulled node.  The **parent**
-    of that prim in the USD hierarchy is the asset prim (e.g.
-    ``/assets/character/gibro``).
+    Maya USD stores a ``Maya:Pull:DagPath`` custom-data key on
+    the prim with the Maya DAG path of the pulled node.  The
+    **parent** of that prim is the asset prim whose name we want.
 
-    ``stage.TraverseAll()`` visits prims even when they are inactive
-    (pulled), so we can always find the MayaReference prim and read
-    both the DAG path (→ Maya namespace) and the parent prim name
-    (→ asset name).
+    ``stage.TraverseAll()`` visits prims even when they are
+    inactive (pulled into Maya), so we can always find them.
 
     Returns:
         dict[str, str]: ``{maya_namespace: asset_prim_name}``.
@@ -61,52 +52,80 @@ def _get_namespace_to_asset_name():
     try:
         import mayaUsd.ufe
     except ImportError:
+        print("[AnimCacheUSD] mayaUsd.ufe not available")
         return {}
 
     ns_to_name = {}
     proxy_shapes = cmds.ls(type="mayaUsdProxyShape", long=True) or []
+    print(f"[AnimCacheUSD] Found {len(proxy_shapes)} proxy shape(s)")
 
     for proxy in proxy_shapes:
         try:
             stage = mayaUsd.ufe.getStage(proxy)
             if not stage:
+                print(f"[AnimCacheUSD]   {proxy}: no stage")
                 continue
 
+            print(f"[AnimCacheUSD]   {proxy}: traversing stage...")
+            prim_count = 0
+            pull_count = 0
+
             for prim in stage.TraverseAll():
-                dag_path = prim.GetCustomDataByKey(_PULL_DG_KEY)
-                if not dag_path:
+                prim_count += 1
+                dag = prim.GetCustomDataByKey("Maya:Pull:DagPath")
+                if not dag:
                     continue
 
-                # dag_path is e.g. "|rigMain:rig" or "|rigMain1:rig"
-                # Extract the Maya namespace from it.
-                short = dag_path.rsplit("|", 1)[-1]
+                pull_count += 1
+                print(
+                    f"[AnimCacheUSD]   Pulled prim: "
+                    f"{prim.GetPath()} -> dag='{dag}'"
+                )
+
+                # Extract Maya namespace from DAG path.
+                # dag is e.g. "|rigMain:rig" or "|rigMain1:rig"
+                short = dag.rsplit("|", 1)[-1]
                 if ":" not in short:
+                    print(
+                        f"[AnimCacheUSD]     No namespace in "
+                        f"'{short}', skipping"
+                    )
                     continue
                 maya_ns = short.split(":")[0]
 
-                # The parent prim name IS the asset name.
+                # Parent prim name = asset name
                 parent = prim.GetParent()
                 if not parent or parent.IsPseudoRoot():
+                    print(
+                        f"[AnimCacheUSD]     Parent is pseudo-root, "
+                        f"skipping"
+                    )
                     continue
 
                 asset_name = parent.GetName()
                 ns_to_name[maya_ns] = asset_name
+                print(
+                    f"[AnimCacheUSD]     MAPPED: "
+                    f"'{maya_ns}' -> '{asset_name}'"
+                )
 
-        except (RuntimeError, AttributeError):
+            print(
+                f"[AnimCacheUSD]   Traversed {prim_count} prims, "
+                f"{pull_count} pulled"
+            )
+
+        except Exception as exc:
+            print(f"[AnimCacheUSD]   Error on {proxy}: {exc}")
+            import traceback
+            traceback.print_exc()
             continue
 
+    print(f"[AnimCacheUSD] Final mapping: {ns_to_name}")
     return ns_to_name
 
 
 def _group_members_by_namespace(members):
     """Group Maya DAG nodes by their root namespace.
-
-    When an asset is loaded via "Edit as Maya Data" each asset lives
-    under its own Maya namespace (e.g. ``cone_character_01:pCube1``).
-    This function groups members so that each group corresponds to
-    one asset.
-
-    Members **without** a namespace are collected under the key ``""``.
 
     Args:
         members (list[str]): Long DAG paths.
@@ -302,8 +321,8 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         members from more than one Maya namespace, one instance is
         created per namespace (i.e. per loaded asset).  Each instance
         receives the subset of members that belong to that asset, and
-        its product name uses the **asset name** (from the USD
-        container metadata), not the Maya namespace.
+        its product name uses the **asset name** (from the pulled USD
+        prim's parent), not the Maya namespace.
 
         Selected parent transforms are automatically expanded to their
         descendant mesh geometry so the user can select rig roots or
@@ -311,6 +330,7 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
         """
 
         members = cmds.ls(selection=True, long=True, type="dagNode")
+        print(f"[AnimCacheUSD] Selection: {members}")
 
         if not members:
             self.log.warning(
@@ -323,8 +343,9 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
 
         # Expand parent transforms to include descendant geometry
         members = _expand_to_geometry(members)
-        self.log.debug(
-            f"Members after geometry expansion: {len(members)} nodes"
+        print(
+            f"[AnimCacheUSD] After geometry expansion: "
+            f"{len(members)} nodes"
         )
 
         split_per_asset = pre_create_data.get("splitPerAsset", True)
@@ -337,6 +358,10 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
 
         # --- Multi-asset split ---
         groups = _group_members_by_namespace(members)
+        print(
+            f"[AnimCacheUSD] Namespace groups: "
+            f"{list(groups.keys())}"
+        )
 
         # Single group → no split needed
         if len(groups) <= 1:
@@ -345,9 +370,9 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
                 product_name, instance_data, pre_create_data
             )
 
-        # Query container metadata to get proper asset names
+        # Resolve Maya namespace → USD asset name
         ns_to_asset = _get_namespace_to_asset_name()
-        self.log.debug(f"Namespace → asset name map: {ns_to_asset}")
+        print(f"[AnimCacheUSD] ns_to_asset = {ns_to_asset}")
 
         self.log.info(
             f"Splitting selection into {len(groups)} asset instances: "
@@ -360,12 +385,9 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
 
         instances = []
         for namespace, ns_members in sorted(groups.items()):
-            # Use asset name from container, not the Maya namespace.
-            # Maya may auto-number namespaces (rigMain → rigMain1),
-            # so try exact match first, then prefix match.
+            # Look up asset name.  Try exact match, then prefix.
             asset_name = ns_to_asset.get(namespace)
             if not asset_name:
-                # Prefix match: "rigMain1" starts with "rigMain"
                 for stored_ns, name in ns_to_asset.items():
                     if namespace.startswith(stored_ns):
                         asset_name = name
@@ -373,28 +395,27 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
             if not asset_name:
                 asset_name = namespace or "default"
 
-            # Clean the name for use in variant
-            # "cone_character" → "ConeCharacter"
-            clean_name = asset_name.replace(":", "_").replace(" ", "_")
-            variant_suffix = "".join(
-                part.capitalize() for part in clean_name.split("_") if part
+            print(
+                f"[AnimCacheUSD] namespace='{namespace}' "
+                f"-> asset='{asset_name}'"
             )
 
-            base_variant = instance_data.get(
-                "variant",
-                self.get_default_variant()
+            # Build variant: "Main" + "Gibro" → "MainGibro"
+            clean = asset_name.replace(":", "_").replace(" ", "_")
+            suffix = "".join(
+                p.capitalize() for p in clean.split("_") if p
             )
-            variant = base_variant + variant_suffix
+            base_variant = instance_data.get(
+                "variant", self.get_default_variant()
+            )
+            variant = base_variant + suffix
 
             asset_product_name = self.get_product_name(
-                project_name,
-                folder_entity,
-                task_entity,
-                variant,
+                project_name, folder_entity, task_entity, variant,
             )
 
-            asset_instance_data = dict(instance_data)
-            asset_instance_data["variant"] = variant
+            asset_data = dict(instance_data)
+            asset_data["variant"] = variant
 
             self.log.info(
                 f"Creating '{asset_product_name}' — "
@@ -402,11 +423,12 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
                 f"{len(ns_members)} members"
             )
 
-            # Select ONLY this group's members
+            # Select this namespace's members before super().create()
+            # reads cmds.ls(selection=True)
             cmds.select(ns_members, replace=True, noExpand=True)
 
             inst = super().create(
-                asset_product_name, asset_instance_data, pre_create_data
+                asset_product_name, asset_data, pre_create_data
             )
             instances.append(inst)
 
