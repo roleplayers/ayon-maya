@@ -68,7 +68,8 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
             f"Collected animation cache USD: "
             f"prim_path={asset_prim_path}, "
             f"department={department}, "
-            f"sampling={sampling_mode}"
+            f"sampling={sampling_mode}, "
+            f"members={len(set_members)}"
         )
 
     def _detect_asset_prim_path(self, instance):
@@ -266,8 +267,14 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
     def _detect_department(self, instance):
         """Detect department from task context or use override.
 
+        Checks the creator attribute first. When set to ``"auto"``,
+        resolves from the current task entity using both task name
+        and task type for maximum compatibility across studio naming
+        conventions.
+
         Returns:
-            str: Department name (animation, layout, cfx, fx, or auto)
+            str: Department name (animation, layout, cfx, fx) or "auto"
+                 if detection fails.
         """
 
         creator_attrs = instance.data.get("creator_attributes", {})
@@ -282,7 +289,8 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
             if not task_entity:
                 return "auto"
 
-            task_name = task_entity.get("name", "").lower()
+            task_name = (task_entity.get("name") or "").lower()
+            task_type = (task_entity.get("taskType") or "").lower()
 
             dept_mapping = {
                 "anim": "animation",
@@ -292,13 +300,15 @@ class CollectAnimationCacheUsd(plugin.MayaInstancePlugin):
                 "fx": "fx",
             }
 
-            for key, dept in dept_mapping.items():
-                if key in task_name:
-                    self.log.debug(
-                        f"Auto-detected department: {dept} "
-                        f"from task: {task_name}"
-                    )
-                    return dept
+            # Check task name first, then task type
+            for source in (task_name, task_type):
+                for key, dept in dept_mapping.items():
+                    if key in source:
+                        self.log.debug(
+                            f"Auto-detected department: {dept} "
+                            f"from task: {task_name} (type: {task_type})"
+                        )
+                        return dept
 
         except Exception as e:
             self.log.debug(f"Error auto-detecting department: {e}")
