@@ -76,20 +76,27 @@ def _detect_department_from_context(create_context):
 
 
 def _get_namespace_to_asset_name():
-    """Map Maya namespaces to USD asset prim names from containers.
+    """Map Maya namespaces to USD asset prim names.
 
-    Queries all ``mayaUsdProxyShape`` nodes, traverses their stages,
-    and collects AYON container metadata.  Returns a dict mapping
-    the container's ``ayon:namespace`` to the **prim name** (last
-    path component) of the container prim — which is the asset name
-    as it appears in the USD stage hierarchy.
+    The Maya namespace used by "Edit as Maya Data" comes from the
+    ``mayaNamespace`` attribute on the ``MayaReference`` prim — NOT
+    from the AYON container's ``ayon:namespace`` (which is set by the
+    loader and may differ).
+
+    This function traverses all USD stages, finds ``MayaReference``
+    prims, reads their ``mayaNamespace`` attribute, and maps it to the
+    **parent prim name** (which is the asset name in the stage
+    hierarchy, e.g. ``cone_character``).
+
+    Maya may auto-number namespaces to avoid conflicts (e.g.
+    ``rigMain`` → ``rigMain1``), so the returned dict maps both the
+    stored namespace and any numbered variants found in the members.
 
     Returns:
         dict[str, str]: ``{maya_namespace: asset_prim_name}``.
     """
     try:
         import mayaUsd
-        from ayon_core.pipeline.constants import AVALON_CONTAINER_ID
     except ImportError:
         return {}
 
@@ -102,11 +109,19 @@ def _get_namespace_to_asset_name():
             if not stage:
                 continue
             for prim in stage.Traverse():
-                if prim.GetCustomDataByKey("ayon:id") == AVALON_CONTAINER_ID:
-                    ns = prim.GetCustomDataByKey("ayon:namespace") or ""
-                    prim_name = prim.GetPath().name  # e.g. "cone_character"
-                    if ns:
-                        ns_to_name[ns] = prim_name
+                if prim.GetTypeName() != "MayaReference":
+                    continue
+                ns_attr = prim.GetAttribute("mayaNamespace")
+                if not ns_attr or not ns_attr.Get():
+                    continue
+                maya_ns = str(ns_attr.Get())
+
+                # The asset name is the parent prim's name.
+                # e.g. /shot/assets/character/cone_character/rig
+                #       → parent "cone_character" is the asset name
+                parent = prim.GetParent()
+                if parent and not parent.IsPseudoRoot():
+                    ns_to_name[maya_ns] = parent.GetName()
         except (RuntimeError, AttributeError):
             continue
 
@@ -396,8 +411,16 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
 
         instances = []
         for namespace, ns_members in sorted(groups.items()):
-            # Use asset name from container, not the Maya namespace
-            asset_name = ns_to_asset.get(namespace, namespace)
+            # Use asset name from container, not the Maya namespace.
+            # Maya may auto-number namespaces (rigMain → rigMain1),
+            # so try exact match first, then prefix match.
+            asset_name = ns_to_asset.get(namespace)
+            if not asset_name:
+                # Prefix match: "rigMain1" starts with "rigMain"
+                for stored_ns, name in ns_to_asset.items():
+                    if namespace.startswith(stored_ns):
+                        asset_name = name
+                        break
             if not asset_name:
                 asset_name = namespace or "default"
 
