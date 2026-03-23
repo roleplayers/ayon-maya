@@ -79,24 +79,18 @@ def _get_namespace_to_asset_name():
     """Map Maya namespaces to USD asset prim names.
 
     The Maya namespace used by "Edit as Maya Data" comes from the
-    ``mayaNamespace`` attribute on the ``MayaReference`` prim — NOT
-    from the AYON container's ``ayon:namespace`` (which is set by the
-    loader and may differ).
-
-    This function traverses all USD stages, finds ``MayaReference``
-    prims, reads their ``mayaNamespace`` attribute, and maps it to the
-    **parent prim name** (which is the asset name in the stage
-    hierarchy, e.g. ``cone_character``).
-
-    Maya may auto-number namespaces to avoid conflicts (e.g.
-    ``rigMain`` → ``rigMain1``), so the returned dict maps both the
-    stored namespace and any numbered variants found in the members.
+    ``mayaNamespace`` attribute on the ``MayaReference`` prim.  When
+    editing is active, the prim may be invisible in the composed
+    stage (``stage.Traverse()`` skips it), so this function reads the
+    **individual Sdf layers** directly — which always contain the
+    authored opinions regardless of composition state.
 
     Returns:
         dict[str, str]: ``{maya_namespace: asset_prim_name}``.
     """
     try:
         import mayaUsd
+        from pxr import Sdf
     except ImportError:
         return {}
 
@@ -108,24 +102,50 @@ def _get_namespace_to_asset_name():
             stage = mayaUsd.ufe.getStage(proxy)
             if not stage:
                 continue
-            for prim in stage.Traverse():
-                if prim.GetTypeName() != "MayaReference":
-                    continue
-                ns_attr = prim.GetAttribute("mayaNamespace")
-                if not ns_attr or not ns_attr.Get():
-                    continue
-                maya_ns = str(ns_attr.Get())
 
-                # The asset name is the parent prim's name.
-                # e.g. /shot/assets/character/cone_character/rig
-                #       → parent "cone_character" is the asset name
-                parent = prim.GetParent()
-                if parent and not parent.IsPseudoRoot():
-                    ns_to_name[maya_ns] = parent.GetName()
+            # Read ALL layers used by the stage (sublayers,
+            # referenced files, etc.) via the Sdf API — this
+            # bypasses composition and sees MayaReference prims
+            # even when "Edit as Maya Data" is active.
+            for layer in stage.GetUsedLayers():
+                _search_layer_for_maya_refs(
+                    layer,
+                    Sdf.Path.absoluteRootPath,
+                    ns_to_name,
+                )
+
         except (RuntimeError, AttributeError):
             continue
 
     return ns_to_name
+
+
+def _search_layer_for_maya_refs(layer, parent_path, result):
+    """Recursively search an Sdf.Layer for MayaReference prim specs.
+
+    When a prim spec has ``typeName == "MayaReference"`` and a
+    ``mayaNamespace`` attribute, records the mapping
+    ``{mayaNamespace: parent_prim_name}`` in *result*.
+    """
+    spec = layer.GetPrimAtPath(parent_path)
+    if not spec:
+        return
+
+    for child_spec in spec.nameChildren:
+        child_path = parent_path.AppendChild(child_spec.name)
+
+        if child_spec.typeName == "MayaReference":
+            ns_attr = child_spec.attributes.get("mayaNamespace")
+            if ns_attr and ns_attr.default:
+                maya_ns = str(ns_attr.default)
+                # Asset name = parent prim name
+                # e.g. /cone_character/rig → "cone_character"
+                parent_name = parent_path.name
+                if parent_name:
+                    result[maya_ns] = parent_name
+
+        # Recurse into children
+        _search_layer_for_maya_refs(layer, child_path, result)
 
 
 def _group_members_by_namespace(members):
