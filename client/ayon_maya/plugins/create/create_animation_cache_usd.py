@@ -35,93 +35,86 @@ from ayon_core.lib import (
 from maya import cmds
 
 
-def _get_namespace_to_asset_name():
-    """Map Maya namespaces to USD asset prim names.
+def _get_pulled_prims():
+    """Find all pulled MayaReference prims and their DAG paths.
 
-    When "Edit as Maya Data" is active on a MayaReference prim,
-    Maya USD stores a ``Maya:Pull:DagPath`` custom-data key on
-    the prim with the Maya DAG path of the pulled node.  The
-    **parent** of that prim is the asset prim whose name we want.
-
-    ``stage.TraverseAll()`` visits prims even when they are
-    inactive (pulled into Maya), so we can always find them.
+    When "Edit as Maya Data" is active, Maya USD stores
+    ``Maya:Pull:DagPath`` on the prim.  The **parent** prim name
+    is the asset name.
 
     Returns:
-        dict[str, str]: ``{maya_namespace: asset_prim_name}``.
+        list[tuple[str, str]]: ``[(dag_path, asset_name), ...]``.
     """
     try:
         import mayaUsd.ufe
     except ImportError:
-        print("[AnimCacheUSD] mayaUsd.ufe not available")
-        return {}
+        return []
 
-    ns_to_name = {}
+    pulled = []
     proxy_shapes = cmds.ls(type="mayaUsdProxyShape", long=True) or []
-    print(f"[AnimCacheUSD] Found {len(proxy_shapes)} proxy shape(s)")
 
     for proxy in proxy_shapes:
         try:
             stage = mayaUsd.ufe.getStage(proxy)
             if not stage:
-                print(f"[AnimCacheUSD]   {proxy}: no stage")
                 continue
 
-            print(f"[AnimCacheUSD]   {proxy}: traversing stage...")
-            prim_count = 0
-            pull_count = 0
-
             for prim in stage.TraverseAll():
-                prim_count += 1
                 dag = prim.GetCustomDataByKey("Maya:Pull:DagPath")
                 if not dag:
                     continue
 
-                pull_count += 1
-                print(
-                    f"[AnimCacheUSD]   Pulled prim: "
-                    f"{prim.GetPath()} -> dag='{dag}'"
-                )
-
-                # Extract Maya namespace from DAG path.
-                # dag is e.g. "|rigMain:rig" or "|rigMain1:rig"
-                short = dag.rsplit("|", 1)[-1]
-                if ":" not in short:
-                    print(
-                        f"[AnimCacheUSD]     No namespace in "
-                        f"'{short}', skipping"
-                    )
-                    continue
-                maya_ns = short.split(":")[0]
-
-                # Parent prim name = asset name
                 parent = prim.GetParent()
                 if not parent or parent.IsPseudoRoot():
-                    print(
-                        f"[AnimCacheUSD]     Parent is pseudo-root, "
-                        f"skipping"
-                    )
                     continue
 
                 asset_name = parent.GetName()
-                ns_to_name[maya_ns] = asset_name
+                pulled.append((dag, asset_name))
                 print(
-                    f"[AnimCacheUSD]     MAPPED: "
-                    f"'{maya_ns}' -> '{asset_name}'"
+                    f"[AnimCacheUSD] Pulled: {prim.GetPath()} "
+                    f"dag='{dag}' -> asset='{asset_name}'"
                 )
 
-            print(
-                f"[AnimCacheUSD]   Traversed {prim_count} prims, "
-                f"{pull_count} pulled"
-            )
-
         except Exception as exc:
-            print(f"[AnimCacheUSD]   Error on {proxy}: {exc}")
-            import traceback
-            traceback.print_exc()
+            print(f"[AnimCacheUSD] Error on {proxy}: {exc}")
             continue
 
-    print(f"[AnimCacheUSD] Final mapping: {ns_to_name}")
-    return ns_to_name
+    return pulled
+
+
+def _match_namespaces_to_assets(ns_groups, pulled_prims):
+    """Match namespace groups to asset names via DAG path prefix.
+
+    Each pulled prim has a DAG path (e.g.
+    ``|__mayaUsd__|rigParent|rig``).  Members of a namespace group
+    are children of that DAG hierarchy (e.g.
+    ``|__mayaUsd__|rigParent|rig|rigMain:gibro|...``).
+
+    By checking which pulled prim's DAG path is a prefix of the
+    members in each group, we can map the namespace to the asset.
+
+    Args:
+        ns_groups: ``{namespace: [member_paths]}``.
+        pulled_prims: ``[(dag_path, asset_name), ...]``.
+
+    Returns:
+        dict[str, str]: ``{maya_namespace: asset_prim_name}``.
+    """
+    ns_to_asset = {}
+
+    for ns, members in ns_groups.items():
+        for dag_path, asset_name in pulled_prims:
+            prefix = dag_path + "|"
+            if any(m.startswith(prefix) for m in members):
+                ns_to_asset[ns] = asset_name
+                print(
+                    f"[AnimCacheUSD] MATCHED: ns='{ns}' "
+                    f"-> asset='{asset_name}' "
+                    f"(via dag prefix '{dag_path}')"
+                )
+                break
+
+    return ns_to_asset
 
 
 def _group_members_by_namespace(members):
@@ -370,8 +363,10 @@ class CreateAnimationCacheUsd(plugin.MayaCreator):
                 product_name, instance_data, pre_create_data
             )
 
-        # Resolve Maya namespace → USD asset name
-        ns_to_asset = _get_namespace_to_asset_name()
+        # Resolve Maya namespace → USD asset name by matching
+        # each group's member DAG paths against pulled prim roots.
+        pulled_prims = _get_pulled_prims()
+        ns_to_asset = _match_namespaces_to_assets(groups, pulled_prims)
         print(f"[AnimCacheUSD] ns_to_asset = {ns_to_asset}")
 
         self.log.info(
