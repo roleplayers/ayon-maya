@@ -52,28 +52,61 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
     def process(self, instance):
         """Process the animation cache USD extraction.
 
+        When the instance members span multiple Maya namespaces (i.e.
+        multiple characters), each namespace is exported separately to
+        avoid prim-name collisions caused by ``stripNamespaces``.  The
+        per-namespace exports are then remapped and merged into a
+        single output layer.
+
         Steps:
-        1. Export selected geometry with animation (as point cache)
-        2. Remap hierarchy + apply resetXformStack (single Sdf pass)
-        3. Generate representation
+        1. Detect namespaces in the member list
+        2. Export each namespace separately (or all at once for single)
+        3. Remap hierarchy + apply resetXformStack
+        4. Generate representation
         """
 
         staging_dir = self.staging_dir(instance)
-
-        # 1. Export animation cache USD (point cache)
-        self.log.info("Exporting animation cache USD (point cache)...")
-        cache_file = self._export_animation_cache(instance, staging_dir)
-
-        # 2. Remap hierarchy to match original asset prim path(s)
         creator_attrs = instance.data.get("creator_attributes", {})
         apply_reset = creator_attrs.get("resetXformStack", True)
-        self._remap_to_asset_hierarchy(
-            cache_file, instance, reset_xform_stack=apply_reset
+
+        members = instance.data.get("setMembers", [])
+        all_paths = instance.data.get("allAssetPrimPaths", {})
+
+        # Group members by namespace
+        ns_groups = self._group_by_namespace(members)
+        self.log.debug(
+            f"Member namespaces: {list(ns_groups.keys())} "
+            f"({len(members)} members total)"
         )
 
-        cache_filename = os.path.basename(cache_file)
+        cache_filename = f"{instance.name}_cache.usd"
+        cache_file = os.path.join(
+            staging_dir, cache_filename
+        ).replace("\\", "/")
 
-        # 3. Add representation
+        if len(ns_groups) > 1 and len(all_paths) > 1:
+            # --- Multi-namespace export ---
+            # Export each namespace separately to avoid prim-name
+            # collisions when stripNamespaces is enabled.
+            self.log.info(
+                f"Multi-namespace export: {len(ns_groups)} groups, "
+                f"exporting each separately to avoid collisions"
+            )
+            self._export_multi_namespace(
+                instance, staging_dir, cache_file,
+                ns_groups, all_paths, apply_reset
+            )
+        else:
+            # --- Single-namespace export ---
+            self.log.info(
+                "Exporting animation cache USD (point cache)..."
+            )
+            self._export_single(instance, staging_dir, cache_file)
+            self._remap_to_asset_hierarchy(
+                cache_file, instance, reset_xform_stack=apply_reset
+            )
+
+        # Add representation
         if "representations" not in instance.data:
             instance.data["representations"] = []
 
@@ -86,22 +119,37 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
 
         self.log.info(f"Extracted point cache: {cache_filename}")
 
-    def _export_animation_cache(self, instance, staging_dir) -> str:
-        """Export animated geometry as USD point cache.
+    # ------------------------------------------------------------------
+    # Namespace grouping
+    # ------------------------------------------------------------------
 
-        Args:
-            instance: Publish instance
-            staging_dir: Staging directory for output
+    @staticmethod
+    def _group_by_namespace(members):
+        """Group Maya DAG nodes by their root namespace.
 
         Returns:
-            str: Path to exported USD file
+            dict[str, list[str]]: ``{namespace: [members]}``.
         """
+        groups = {}
+        for member in members:
+            short_name = member.rsplit("|", 1)[-1]
+            if ":" in short_name:
+                ns = short_name.split(":")[0]
+            else:
+                ns = ""
+            groups.setdefault(ns, []).append(member)
+        return groups
 
-        cmds.loadPlugin("mayaUsdPlugin", quiet=True)
+    # ------------------------------------------------------------------
+    # Export helpers
+    # ------------------------------------------------------------------
 
-        filename = f"{instance.name}_cache.usd"
-        filepath = os.path.join(staging_dir, filename).replace("\\", "/")
+    def _build_export_options(self, instance, filepath):
+        """Build common ``cmds.mayaUSDExport`` options dict.
 
+        Returns:
+            tuple: (options_dict, has_worldspace)
+        """
         creator_attrs = instance.data.get("creator_attributes", {})
         sampling_mode = instance.data.get("samplingMode", "sparse")
         custom_step = instance.data.get("customStepSize", 1.0)
@@ -109,20 +157,6 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         frame_step = 1.0
         if sampling_mode == "custom":
             frame_step = custom_step
-
-        members = instance.data.get("setMembers", [])
-        if not members:
-            raise PublishValidationError(
-                f"No members to export for {instance.name}"
-            )
-
-        self.log.info(f"Exporting point cache for {len(members)} members")
-        self.log.debug(f"Members: {members}")
-        self.log.debug(
-            f"Frame range: {instance.data.get('frameStart', 1)}"
-            f"-{instance.data.get('frameEnd', 1)}"
-        )
-        self.log.debug(f"Sampling: {sampling_mode} (step: {frame_step})")
 
         options = {
             "file": filepath,
@@ -147,7 +181,6 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
             "eulerFilter": True,
         }
 
-        # Try worldspace if available (Maya USD 0.21.0+)
         has_worldspace = False
         try:
             maya_usd_version = parse_version(
@@ -159,14 +192,39 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
         except Exception as e:
             self.log.debug(f"Could not determine Maya USD version: {e}")
 
-        self.log.debug(f"Export options: {options}")
+        return options, has_worldspace
+
+    def _run_export(self, members, options, has_worldspace):
+        """Select *members*, run ``cmds.mayaUSDExport``, return success.
+
+        Retries without ``worldspace`` if the first attempt fails.
+
+        Raises:
+            PublishValidationError: If all attempts fail.
+        """
+        filepath = options["file"]
+
+        # Validate members exist in scene
+        existing = cmds.ls(members, long=True) or []
+        if not existing:
+            raise PublishValidationError(
+                f"None of the {len(members)} member(s) exist in the "
+                f"scene. They may have been deleted or renamed.\n"
+                f"First few: {members[:5]}"
+            )
+        if len(existing) < len(members):
+            missing = set(members) - set(existing)
+            self.log.warning(
+                f"{len(missing)} member(s) no longer exist in scene "
+                f"and will be skipped: {list(missing)[:5]}"
+            )
 
         fallbacks = [{}]
         if has_worldspace:
             fallbacks.append({"worldspace": False})
 
         with maintained_selection():
-            cmds.select(members, replace=True, noExpand=True)
+            cmds.select(existing, replace=True, noExpand=True)
             last_error = None
             for i, overrides in enumerate(fallbacks):
                 attempt_opts = dict(options, **overrides)
@@ -183,14 +241,17 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                     break
                 except RuntimeError as e:
                     last_error = e
-                    self.log.warning(f"Export attempt {i + 1} failed: {e}")
+                    self.log.warning(
+                        f"Export attempt {i + 1} failed: {e}"
+                    )
 
             if last_error is not None:
                 raise PublishValidationError(
                     f"Failed to export USD animation cache after "
                     f"{len(fallbacks)} attempt(s): {last_error}\n\n"
                     f"This can happen with complex rigs. Try:\n"
-                    f"- Selecting only the geometry group (not the rig root)\n"
+                    f"- Selecting only the geometry group "
+                    f"(not the rig root)\n"
                     f"- Checking for invalid mesh topology\n"
                     f"- Ensuring all deformers evaluate correctly"
                 )
@@ -200,8 +261,176 @@ class ExtractAnimationCacheUsd(plugin.MayaExtractorPlugin):
                 f"USD export failed, file not created: {filepath}"
             )
 
+    # ------------------------------------------------------------------
+    # Single-namespace export
+    # ------------------------------------------------------------------
+
+    def _export_single(self, instance, staging_dir, filepath):
+        """Export all members at once into *filepath*."""
+        cmds.loadPlugin("mayaUsdPlugin", quiet=True)
+
+        members = instance.data.get("setMembers", [])
+        if not members:
+            raise PublishValidationError(
+                f"No members to export for {instance.name}"
+            )
+
+        self.log.info(
+            f"Exporting point cache for {len(members)} members"
+        )
+        self.log.debug(f"Members: {members}")
+
+        options, has_worldspace = self._build_export_options(
+            instance, filepath
+        )
+        self._run_export(members, options, has_worldspace)
         self.log.debug(f"Exported point cache USD: {filepath}")
-        return filepath
+
+    # ------------------------------------------------------------------
+    # Multi-namespace export
+    # ------------------------------------------------------------------
+
+    def _export_multi_namespace(self, instance, staging_dir, filepath,
+                                ns_groups, all_paths, reset_xform_stack):
+        """Export each namespace separately and merge into *filepath*.
+
+        When ``stripNamespaces`` is enabled and multiple characters
+        share the same mesh names (e.g. both have ``geo/CC_Base_Body``),
+        exporting them together causes prim-name collisions — only one
+        character survives.
+
+        This method exports each namespace individually, remaps each
+        to its correct asset prim path, then merges all results into
+        a single output layer.
+        """
+        cmds.loadPlugin("mayaUsdPlugin", quiet=True)
+
+        base_options, has_worldspace = self._build_export_options(
+            instance, filepath
+        )
+
+        merged_layer = None
+        exported_count = 0
+
+        for ns, ns_members in sorted(ns_groups.items()):
+            # Find the target prim path for this namespace
+            target_path_str = all_paths.get(ns)
+            if not target_path_str:
+                # Prefix match: "rigMain1" starts with "rigMain"
+                for stored_ns, path_str in all_paths.items():
+                    if ns.startswith(stored_ns) or stored_ns.startswith(ns):
+                        target_path_str = path_str
+                        break
+
+            if not target_path_str:
+                self.log.warning(
+                    f"No target prim path for namespace '{ns}'. "
+                    f"Skipping {len(ns_members)} members."
+                )
+                continue
+
+            # Export this namespace to a temp file
+            temp_name = f"{instance.name}_{ns}_temp.usd"
+            temp_path = os.path.join(
+                staging_dir, temp_name
+            ).replace("\\", "/")
+
+            ns_options = dict(base_options, file=temp_path)
+
+            self.log.info(
+                f"Exporting namespace '{ns}' "
+                f"({len(ns_members)} members) → {target_path_str}"
+            )
+
+            try:
+                self._run_export(ns_members, ns_options, has_worldspace)
+            except PublishValidationError as e:
+                self.log.error(
+                    f"Export failed for namespace '{ns}': {e}"
+                )
+                continue
+
+            # Read exported layer and remap to target path
+            temp_layer = Sdf.Layer.FindOrOpen(temp_path)
+            if not temp_layer:
+                self.log.error(
+                    f"Could not open exported USD for namespace "
+                    f"'{ns}': {temp_path}"
+                )
+                continue
+
+            self._log_layer_structure(temp_layer)
+
+            target = Sdf.Path(target_path_str)
+
+            # Find the source subtree (geometry root)
+            source = self._find_geometry_root(temp_layer)
+            if not source:
+                self.log.error(
+                    f"No geometry found in export for namespace "
+                    f"'{ns}'"
+                )
+                continue
+
+            self.log.info(
+                f"Remapping namespace '{ns}': "
+                f"{source} → {target}"
+            )
+
+            # Sanitise the source subtree
+            self._cleanup_non_geometry(temp_layer, source)
+            self._strip_material_bindings(temp_layer, source)
+            self._convert_to_over_specifiers(temp_layer, source)
+            if reset_xform_stack:
+                self._apply_reset_xform_stack_sdf(temp_layer, source)
+
+            # Create or reuse the merged layer
+            if merged_layer is None:
+                merged_layer = Sdf.Layer.CreateAnonymous()
+                self._copy_layer_metadata(temp_layer, merged_layer)
+
+            # Create parent hierarchy with 'over' specifiers
+            prefixes = target.GetPrefixes()
+            for prefix in prefixes[:-1]:
+                if not merged_layer.GetPrimAtPath(prefix):
+                    ps = Sdf.CreatePrimInLayer(merged_layer, prefix)
+                    ps.specifier = Sdf.SpecifierOver
+                    ps.typeName = "Xform"
+
+            # Copy the source subtree to the target path
+            if not Sdf.CopySpec(
+                temp_layer, source, merged_layer, target
+            ):
+                self.log.error(
+                    f"Failed to copy {source} → {target} "
+                    f"for namespace '{ns}'"
+                )
+                continue
+
+            exported_count += 1
+
+            # Clean up temp file
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+        if exported_count == 0:
+            raise PublishValidationError(
+                f"No namespaces exported successfully for "
+                f"{instance.name}. Check that the animated geometry "
+                f"exists and is valid."
+            )
+
+        # Set defaultPrim and export
+        root_prims = list(merged_layer.rootPrims)
+        if root_prims:
+            merged_layer.defaultPrim = root_prims[0].name
+
+        merged_layer.Export(filepath)
+        self.log.info(
+            f"Merged {exported_count} namespace(s) into {filepath}"
+        )
 
     # ------------------------------------------------------------------
     # Hierarchy remapping + resetXformStack
